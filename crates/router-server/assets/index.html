@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <meta name="description" content="Haarness Router control room and OpenAI-compatible playground">
+    <title>Haarness Router</title>
+    <link rel="stylesheet" href="__HAARNESS_UI_BASE__/assets/app.css">
+    <script src="__HAARNESS_UI_BASE__/assets/app.js" defer></script>
+  </head>
+  <body data-ui-base="__HAARNESS_UI_BASE__">
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <a class="brand" href="#overview" aria-label="Haarness Router home">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span><strong>Haarness</strong><small>Router</small></span>
+        </a>
+
+        <nav class="nav-list">
+          <button class="nav-item active" data-view="overview" type="button"><span class="nav-glyph">01</span>Overview</button>
+          <button class="nav-item" data-view="playground" type="button"><span class="nav-glyph">02</span>Playground</button>
+          <button class="nav-item" data-view="models" type="button"><span class="nav-glyph">03</span>Models & routes</button>
+          <button class="nav-item" data-view="keys" type="button"><span class="nav-glyph">04</span>API keys</button>
+          <button class="nav-item" data-view="observability" type="button"><span class="nav-glyph">05</span>Observability</button>
+          <button class="nav-item" data-view="settings" type="button"><span class="nav-glyph">06</span>Settings</button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="security-chip"><span class="pulse-dot"></span><span id="sidebar-security">Checking security</span></div>
+          <span class="build-label" id="sidebar-version">Router starting…</span>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="page-eyebrow">Control room</p>
+            <h1 id="page-title">Overview</h1>
+          </div>
+          <div class="topbar-actions">
+            <span class="status-pill"><span class="pulse-dot"></span><span id="router-status">Connecting</span></span>
+            <button class="icon-button" id="theme-toggle" type="button" aria-label="Toggle color theme">◐</button>
+            <button class="primary compact" type="button" data-go="playground">New request</button>
+          </div>
+        </header>
+
+        <main>
+          <section class="view active" id="view-overview" data-title="Overview" data-eyebrow="Control room">
+            <div class="hero-grid">
+              <article class="hero-card">
+                <div>
+                  <p class="eyebrow">One protocol. Every model.</p>
+                  <h2>Route clearly.<br><em>Operate calmly.</em></h2>
+                  <p class="hero-copy">A live view of your OpenAI-compatible gateway, provider health, fallback paths, and request activity.</p>
+                </div>
+                <div class="hero-actions">
+                  <button class="primary" type="button" data-go="playground">Open playground</button>
+                  <button class="secondary" type="button" data-go="keys">Manage access</button>
+                </div>
+                <div class="route-art" aria-hidden="true">
+                  <span class="route-origin">API</span>
+                  <span class="route-line one"></span>
+                  <span class="route-line two"></span>
+                  <span class="route-line three"></span>
+                  <span class="route-node n1">O</span>
+                  <span class="route-node n2">A</span>
+                  <span class="route-node n3">G</span>
+                </div>
+              </article>
+
+              <article class="quick-card">
+                <div class="section-heading">
+                  <div><p class="eyebrow">Live pulse</p><h3>Router activity</h3></div>
+                  <span class="tiny-label" id="uptime-label">—</span>
+                </div>
+                <div class="metric-stack">
+                  <div><span>Requests</span><strong id="metric-requests">—</strong></div>
+                  <div><span>Active streams</span><strong id="metric-active">—</strong></div>
+                  <div><span>Error rate</span><strong id="metric-error-rate">—</strong></div>
+                  <div><span>Avg. first event</span><strong id="metric-first-event">—</strong></div>
+                </div>
+                <div class="sparkline" id="request-sparkline" aria-label="Recent request activity"></div>
+              </article>
+            </div>
+
+            <div class="stat-grid" id="overview-stats">
+              <article class="stat-card"><span class="stat-index">A</span><p>Providers</p><strong id="stat-providers">—</strong><small>Configured upstreams</small></article>
+              <article class="stat-card"><span class="stat-index">B</span><p>Models</p><strong id="stat-models">—</strong><small>Declared concrete routes</small></article>
+              <article class="stat-card"><span class="stat-index">C</span><p>Fallback aliases</p><strong id="stat-aliases">—</strong><small>Ordered route policies</small></article>
+              <article class="stat-card"><span class="stat-index">D</span><p>Circuit health</p><strong id="stat-circuits">—</strong><small>Targets closed and ready</small></article>
+            </div>
+
+            <div class="content-grid split-60">
+              <article class="panel">
+                <div class="section-heading">
+                  <div><p class="eyebrow">Upstreams</p><h3>Provider health</h3></div>
+                  <button class="text-button" type="button" data-go="models">Inspect routes →</button>
+                </div>
+                <div class="table-wrap">
+                  <table>
+                    <thead><tr><th>Provider</th><th>Protocol</th><th>Credential</th><th>State</th></tr></thead>
+                    <tbody id="provider-table"><tr><td colspan="4" class="empty-cell">Loading providers…</td></tr></tbody>
+                  </table>
+                </div>
+              </article>
+              <article class="panel">
+                <div class="section-heading"><div><p class="eyebrow">Routing policy</p><h3>Alias paths</h3></div></div>
+                <div class="alias-list" id="alias-list"><p class="empty-copy">Loading route policies…</p></div>
+              </article>
+            </div>
+          </section>
+
+          <section class="view" id="view-playground" data-title="Playground" data-eyebrow="Request studio">
+            <div class="playground-layout">
+              <article class="panel composer-panel">
+                <div class="section-heading">
+                  <div><p class="eyebrow">OpenAI compatible</p><h3>Compose request</h3></div>
+                  <span class="key-state" id="playground-key-state">No router key</span>
+                </div>
+
+                <div class="field-row two">
+                  <label><span>Model or alias</span><select id="playground-model"></select></label>
+                  <label><span>Reasoning effort</span><select id="playground-reasoning"><option value="">Provider default</option><option value="none">None</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+                </div>
+                <label><span>System or developer instruction</span><textarea id="playground-system" rows="3" placeholder="You are a concise, precise assistant."></textarea></label>
+                <label><span>User message</span><textarea id="playground-message" rows="7" placeholder="Ask anything, invoke a tool, or attach multimodal input…"></textarea></label>
+
+                <details class="advanced-block">
+                  <summary>Tools, attachments & generation controls</summary>
+                  <div class="advanced-content">
+                    <div class="field-row two">
+                      <label><span>Temperature</span><input id="playground-temperature" type="number" min="0" max="2" step="0.1" placeholder="Default"></label>
+                      <label><span>Maximum completion tokens</span><input id="playground-max-tokens" type="number" min="1" value="512"></label>
+                    </div>
+                    <div class="field-row two">
+                      <label><span>Attachment kind</span><select id="playground-attachment-kind"><option value="">None</option><option value="image_url">Image URL</option><option value="file">PDF / file URL</option><option value="input_audio_mp3">Audio base64 · MP3</option><option value="input_audio_wav">Audio base64 · WAV</option><option value="video_url">Video URL</option></select></label>
+                      <label><span>HTTPS/data URL or audio base64</span><input id="playground-attachment" type="text" spellcheck="false" placeholder="https://… or base64"></label>
+                    </div>
+                    <label><span>Function tools JSON</span><textarea class="code-input" id="playground-tools" rows="6" spellcheck="false" placeholder='[{"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]'></textarea></label>
+                    <label><span>Structured-output JSON Schema</span><textarea class="code-input" id="playground-schema" rows="5" spellcheck="false" placeholder='{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}'></textarea></label>
+                    <label><span>Per-request upstream key <small>exact provider/model only; never stored</small></span><input id="playground-upstream-key" type="password" autocomplete="off" placeholder="Optional BYOK override"></label>
+                  </div>
+                </details>
+
+                <div class="composer-actions">
+                  <label class="toggle"><input id="playground-stream" type="checkbox" checked><span></span>Stream response</label>
+                  <button class="secondary" id="playground-clear" type="button">Clear</button>
+                  <button class="primary send-button" id="playground-send" type="button">Send request <span>↗</span></button>
+                </div>
+              </article>
+
+              <article class="panel response-panel">
+                <div class="section-heading">
+                  <div><p class="eyebrow">Response</p><h3>Live output</h3></div>
+                  <div class="response-actions"><button class="icon-button" id="copy-response" type="button" aria-label="Copy response">⧉</button><button class="icon-button" id="stop-response" type="button" aria-label="Stop request">■</button></div>
+                </div>
+                <div class="response-meta" id="response-meta">
+                  <span>Provider <b>—</b></span><span>Model <b>—</b></span><span>Attempts <b>—</b></span>
+                </div>
+                <div class="response-body" id="response-body">
+                  <div class="response-empty"><span class="empty-orbit"></span><h4>Ready when you are</h4><p>Your streamed text, reasoning, tool calls, usage, and errors appear here.</p></div>
+                </div>
+                <div class="usage-strip" id="usage-strip"><span>Input <b>—</b></span><span>Output <b>—</b></span><span>Total <b>—</b></span><span>Finish <b>—</b></span></div>
+              </article>
+            </div>
+          </section>
+
+          <section class="view" id="view-models" data-title="Models & routes" data-eyebrow="Capability map">
+            <div class="page-intro">
+              <div><h2>Concrete targets and deliberate fallbacks.</h2><p>Capabilities are validated before an upstream call. Unsupported fields are rejected instead of silently discarded.</p></div>
+              <div class="search-field"><span>⌕</span><input id="model-search" type="search" placeholder="Filter models, providers, capabilities…"></div>
+            </div>
+            <div class="model-grid" id="model-grid"><article class="panel loading-card">Loading model catalog…</article></div>
+            <article class="panel route-map-panel">
+              <div class="section-heading"><div><p class="eyebrow">Ordered fallback</p><h3>Alias route map</h3></div></div>
+              <div id="route-map" class="route-map"></div>
+            </article>
+          </section>
+
+          <section class="view" id="view-keys" data-title="API keys" data-eyebrow="Access control">
+            <div class="page-intro">
+              <div><h2>Short-lived control without secret sprawl.</h2><p>Runtime router keys are returned once, retained only as digests, and disappear when the process restarts. Configured provider keys are never exposed here.</p></div>
+              <button class="primary" id="create-key-button" type="button">Create runtime key</button>
+            </div>
+            <div class="stat-grid key-stats">
+              <article class="stat-card"><span class="stat-index">K</span><p>Bootstrap keys</p><strong id="bootstrap-key-count">—</strong><small>Loaded from environment</small></article>
+              <article class="stat-card"><span class="stat-index">R</span><p>Runtime keys</p><strong id="runtime-key-count">—</strong><small id="runtime-key-limit">Process-local access</small></article>
+              <article class="stat-card wide-stat"><span class="stat-index">S</span><p>Provider secret boundary</p><strong>Sealed</strong><small>Never readable through the UI or API</small></article>
+            </div>
+            <article class="panel">
+              <div class="section-heading"><div><p class="eyebrow">Active credentials</p><h3>Runtime router keys</h3></div><button class="text-button" id="refresh-keys" type="button">Refresh ↻</button></div>
+              <div class="table-wrap">
+                <table><thead><tr><th>Label</th><th>ID</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody id="key-table"><tr><td colspan="5" class="empty-cell">No runtime keys loaded.</td></tr></tbody></table>
+              </div>
+            </article>
+          </section>
+
+          <section class="view" id="view-observability" data-title="Observability" data-eyebrow="Signals, not secrets">
+            <div class="page-intro">
+              <div><h2>Operational detail with bounded labels.</h2><p>Prometheus counters never include prompts, tool arguments, attachments, credentials, or raw upstream errors.</p></div>
+              <div class="toolbar"><span class="tiny-label" id="metrics-updated">Not refreshed</span><button class="secondary compact" id="refresh-metrics" type="button">Refresh metrics</button></div>
+            </div>
+            <div class="stat-grid">
+              <article class="stat-card"><span class="stat-index">Q</span><p>Total requests</p><strong id="obs-requests">—</strong><small>Since process start</small></article>
+              <article class="stat-card"><span class="stat-index">E</span><p>Errors</p><strong id="obs-errors">—</strong><small>Normalized failures</small></article>
+              <article class="stat-card"><span class="stat-index">F</span><p>Fallbacks</p><strong id="obs-fallbacks">—</strong><small>Additional route attempts</small></article>
+              <article class="stat-card"><span class="stat-index">X</span><p>Cancelled</p><strong id="obs-cancelled">—</strong><small>Client-disconnected streams</small></article>
+            </div>
+            <div class="content-grid split-60">
+              <article class="panel"><div class="section-heading"><div><p class="eyebrow">Per route</p><h3>Traffic matrix</h3></div></div><div class="table-wrap"><table><thead><tr><th>Provider / model</th><th>Requests</th><th>Active</th><th>Completed</th><th>Failed</th></tr></thead><tbody id="route-metrics-table"></tbody></table></div></article>
+              <article class="panel raw-metrics-panel"><div class="section-heading"><div><p class="eyebrow">Prometheus</p><h3>Raw exposition</h3></div><button class="icon-button" id="copy-metrics" type="button" aria-label="Copy metrics">⧉</button></div><pre id="raw-metrics">Loading metrics…</pre></article>
+            </div>
+          </section>
+
+          <section class="view" id="view-settings" data-title="Settings" data-eyebrow="Local control plane">
+            <div class="settings-grid">
+              <article class="panel settings-card">
+                <p class="eyebrow">Optional access control</p><h3>Playground router key</h3><p id="router-key-help">Checking whether this router requires an access key.</p>
+                <label><span>Router key</span><input id="settings-router-key" type="password" autocomplete="off" placeholder="hrk_… or bootstrap router key"></label>
+                <div class="button-row"><button class="primary" id="save-router-key" type="button">Use for this session</button><button class="secondary" id="clear-router-key" type="button">Forget key</button></div>
+              </article>
+              <article class="panel settings-card">
+                <p class="eyebrow">Security posture</p><h3>Access settings</h3><div class="definition-list" id="security-settings"><div><span>Router access key</span><b>—</b></div><div><span>HTTP Basic</span><b>—</b></div><div><span>Loopback bind</span><b>—</b></div><div><span>Runtime keys</span><b>—</b></div><div><span>Upstream BYOK</span><b>—</b></div></div>
+              </article>
+              <article class="panel settings-card full-span">
+                <p class="eyebrow">Integration</p><h3>OpenAI-compatible endpoint</h3><p>Point a Chat Completions client at this base URL. Supply a router access key only when this router requires one.</p>
+                <div class="endpoint-box"><code id="endpoint-code">http://127.0.0.1:8080/v1</code><button class="icon-button" id="copy-endpoint" type="button" aria-label="Copy endpoint">⧉</button></div>
+                <pre class="code-sample" id="curl-sample">curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer &lt;router-key&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"default","messages":[{"role":"user","content":"Hello"}],"stream":true}'</pre>
+              </article>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <dialog id="create-key-dialog">
+      <form method="dialog" id="create-key-form">
+        <div class="dialog-head"><div><p class="eyebrow">Runtime access</p><h3>Create router key</h3></div><button class="icon-button" id="close-key-dialog" type="button" aria-label="Close dialog">×</button></div>
+        <p>This key lasts until the router process exits. Its plaintext is returned once and never stored by the server.</p>
+        <label><span>Key label</span><input id="new-key-label" maxlength="64" required placeholder="Local playground"></label>
+        <div class="secret-reveal hidden" id="new-key-reveal"><span>Copy this key now</span><code id="new-key-secret"></code><button class="secondary" id="copy-new-key" type="button">Copy & use in playground</button></div>
+        <div class="dialog-actions" id="create-key-actions"><button class="secondary" id="cancel-key-dialog" type="button">Cancel</button><button class="primary" id="confirm-create-key" type="submit">Create key</button></div>
+      </form>
+    </dialog>
+
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>

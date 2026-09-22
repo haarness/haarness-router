@@ -1,0 +1,23 @@
+[server]
+bind = "127.0.0.1:8081"
+max_request_bytes = 1048576
+max_concurrent_requests = 20000
+first_byte_timeout_ms = 30000
+drain_seconds = 10
+
+[auth]
+router_key_envs = ["HAARNESS_ROUTER_KEY"]
+allow_upstream_key_header = false
+
+[web_ui]
+enabled = false
+
+[providers.mock]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:9091"
+api_key_env = "MOCK_PROVIDER_KEY"
+allow_insecure_http = true
+allow_unknown_fields = true
+capabilities = { text = true, streaming = true, pdf_text_extraction = true, function_tools = true }
+
+[models."mock/test"]

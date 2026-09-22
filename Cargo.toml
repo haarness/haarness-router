@@ -1,0 +1,81 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/router-protocol",
+    "crates/router-core",
+    "crates/router-providers",
+    "crates/router-server",
+    "crates/haarness-router",
+]
+default-members = ["crates/haarness-router"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8.9", features = ["macros"] }
+base64 = "0.22"
+bytes = "1.11"
+clap = { version = "4.5", features = ["derive", "env"] }
+dashmap = "6.1"
+futures = "0.3"
+http = "1.4"
+http-body-util = "0.1"
+infer = "0.22"
+pdf-extract = "0.12"
+png = "0.18"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "http2"] }
+secrecy = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+subtle = "2.6"
+tempfile = "3.23"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "1.0"
+tower = { version = "0.5", features = ["limit", "util"] }
+tower-http = { version = "0.6", features = ["catch-panic", "limit", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.20", features = ["v4", "v7"] }
+zeroize = "1.8"
+
+# Keep hot Rust edits fast; limit debug data while retaining file/line backtraces.
+# Tests inherit dev, so both commands reuse the same dependency profile.
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+# Opt in only when inspecting local variables in a native debugger.
+[profile.debugger]
+inherits = "dev"
+debug = "full"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+must_use_candidate = "allow"
+needless_pass_by_value = "allow"

@@ -1,0 +1,901 @@
+use std::collections::BTreeMap;
+
+use async_stream::try_stream;
+use async_trait::async_trait;
+use futures::StreamExt;
+use router_core::{
+    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, RouterError,
+};
+use router_protocol::{ChatCompletionRequest, Message, MessageContent, Tool, Usage};
+use secrecy::{ExposeSecret, SecretString};
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::{attachment::prepare_pdf_fallback, sse::request_error, transport::ProviderTransport};
+
+pub struct AnthropicAdapter {
+    transport: ProviderTransport,
+    endpoint: String,
+}
+
+impl AnthropicAdapter {
+    pub fn new(config: &ProviderConfig) -> Result<Self, RouterError> {
+        Ok(Self {
+            transport: ProviderTransport::new(config)?,
+            endpoint: format!(
+                "{}/messages",
+                config.effective_base_url()?.trim_end_matches('/')
+            ),
+        })
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for AnthropicAdapter {
+    async fn discover_models(
+        &self,
+        config: &ProviderConfig,
+        api_key: Option<&SecretString>,
+    ) -> Option<Vec<router_protocol::ModelObject>> {
+        crate::models::discover(config, api_key).await
+    }
+
+    async fn stream(
+        &self,
+        model: &str,
+        mut request: ChatCompletionRequest,
+        capabilities: Capabilities,
+        api_key: Option<&SecretString>,
+        cancel: CancellationToken,
+    ) -> Result<EventStream, RouterError> {
+        validate_nested_extensions(&request)?;
+        prepare_pdf_fallback(&mut request, capabilities).await?;
+        let key = api_key.ok_or_else(|| RouterError::unavailable("provider API key is missing"))?;
+        let body = anthropic_request(model, &request)?;
+        let response = self
+            .transport
+            .client()
+            .post(&self.endpoint)
+            .header("x-api-key", key.expose_secret())
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .map_err(request_error)?;
+        let response = self.transport.checked(response).await?;
+        let mut source = self.transport.sse(response, cancel);
+        Ok(Box::pin(try_stream! {
+            let mut thinking = std::collections::HashMap::<u32, String>::new();
+            let mut input_tokens = 0;
+            let mut output_tokens = 0;
+            while let Some(event) = source.next().await {
+                let event = event?;
+                match event.get("type").and_then(Value::as_str).unwrap_or_default() {
+                    "message_start" => {
+                        input_tokens = event.pointer("/message/usage/input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    }
+                    "content_block_start" => {
+                        let block_index = event
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok())
+                            .unwrap_or(0);
+                        let block = event.get("content_block").unwrap_or(&Value::Null);
+                        match block.get("type").and_then(Value::as_str).unwrap_or_default() {
+                            "text" => if let Some(text) = block.get("text").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+                                yield ProviderEvent::TextDelta { index: 0, text: text.into() };
+                            },
+                            "thinking" => if let Some(text) = block.get("thinking").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+                                thinking.entry(block_index).or_default().push_str(text);
+                                yield ProviderEvent::ReasoningDelta { index: 0, text: text.into() };
+                            },
+                            "redacted_thinking" => if let Some(data) = block.get("data") {
+                                yield ProviderEvent::ReasoningDetail { index: 0, detail: json!({
+                                    "type": "reasoning.encrypted", "format": "anthropic-claude-v1",
+                                    "index": block_index, "data": data
+                                }) };
+                            },
+                            "tool_use" => yield ProviderEvent::ToolCallDelta {
+                                choice_index: 0,
+                                tool_index: block_index,
+                                id: block.get("id").and_then(Value::as_str).map(str::to_owned),
+                                kind: "function".into(),
+                                name: block.get("name").and_then(Value::as_str).map(str::to_owned),
+                                arguments: Some(String::new()),
+                            },
+                            _ => {}
+                        }
+                    }
+                    "content_block_delta" => {
+                        let block_index = event
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok())
+                            .unwrap_or(0);
+                        let delta = event.get("delta").unwrap_or(&Value::Null);
+                        match delta.get("type").and_then(Value::as_str).unwrap_or_default() {
+                            "text_delta" => if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                                yield ProviderEvent::TextDelta { index: 0, text: text.into() };
+                            },
+                            "thinking_delta" => if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                                thinking.entry(block_index).or_default().push_str(text);
+                                yield ProviderEvent::ReasoningDelta { index: 0, text: text.into() };
+                            },
+                            "signature_delta" => if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                                yield ProviderEvent::ReasoningDetail { index: 0, detail: json!({
+                                    "type": "reasoning.text", "format": "anthropic-claude-v1",
+                                    "index": block_index, "text": thinking.get(&block_index).cloned().unwrap_or_default(),
+                                    "signature": signature
+                                }) };
+                            },
+                            "input_json_delta" => yield ProviderEvent::ToolCallDelta {
+                                choice_index: 0,
+                                tool_index: block_index,
+                                id: None,
+                                kind: "function".into(),
+                                name: None,
+                                arguments: delta.get("partial_json").and_then(Value::as_str).map(str::to_owned),
+                            },
+                            _ => {}
+                        }
+                    }
+                    "message_delta" => {
+                        output_tokens = event.pointer("/usage/output_tokens").and_then(Value::as_u64).unwrap_or(output_tokens);
+                        yield ProviderEvent::Usage(Usage {
+                            prompt_tokens: input_tokens,
+                            completion_tokens: output_tokens,
+                            total_tokens: input_tokens + output_tokens,
+                            ..Usage::default()
+                        });
+                        if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                            yield ProviderEvent::Finish { index: 0, reason: normalize_finish(reason).into() };
+                        }
+                    }
+                    "error" => Err(RouterError::upstream(
+                        http::StatusCode::BAD_GATEWAY,
+                        "Anthropic stream returned an error event",
+                    ))?,
+                    _ => {}
+                }
+            }
+        }))
+    }
+}
+
+fn anthropic_request(model: &str, request: &ChatCompletionRequest) -> Result<Value, RouterError> {
+    reject_unsupported_parameters(request)?;
+    let mut system = Vec::new();
+    let mut messages = Vec::new();
+    for message in &request.messages {
+        if matches!(message.role.as_str(), "system" | "developer") {
+            let mut blocks = system_content_blocks(message)?;
+            apply_message_cache_control(&mut blocks, message)?;
+            system.extend(blocks);
+            continue;
+        }
+        messages.push(anthropic_message(message)?);
+    }
+    let tools = request
+        .tools
+        .iter()
+        .map(anthropic_tool)
+        .collect::<Result<Vec<_>, _>>()?;
+    let max_tokens = request
+        .max_completion_tokens
+        .or(request.max_tokens)
+        .unwrap_or_else(|| default_anthropic_max_tokens(model, request));
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": true
+    });
+    if !system.is_empty() {
+        body["system"] = Value::Array(system);
+    }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+    }
+    copy_number(&mut body, "temperature", request.temperature);
+    copy_number(&mut body, "top_p", request.top_p);
+    if let Some(stop) = &request.stop {
+        body["stop_sequences"] = match stop {
+            Value::String(value) => json!([value]),
+            value => value.clone(),
+        };
+    }
+    if let Some(choice) = &request.tool_choice {
+        body["tool_choice"] = anthropic_tool_choice(choice)?;
+        if (model.starts_with("claude-fable-5-1") || model.starts_with("claude-mythos-5-1"))
+            && matches!(body["tool_choice"]["type"].as_str(), Some("tool" | "any"))
+        {
+            return Err(RouterError::invalid(
+                "this Claude model supports only auto or none tool_choice",
+                "tool_choice",
+            ));
+        }
+    }
+    apply_anthropic_reasoning(model, request, max_tokens, &mut body)?;
+    if let Some(format) = &request.response_format {
+        let output = body
+            .as_object_mut()
+            .expect("request body is an object")
+            .entry("output_config")
+            .or_insert_with(|| json!({}));
+        match format.get("type").and_then(Value::as_str) {
+            Some("json_schema") => {
+                let schema = format.pointer("/json_schema/schema").ok_or_else(|| {
+                    RouterError::invalid(
+                        "json_schema response format requires schema",
+                        "response_format",
+                    )
+                })?;
+                output["format"] = json!({"type": "json_schema", "schema": schema});
+            }
+            Some("json_object") => {
+                output["format"] = json!({"type": "json_schema", "schema": {"type": "object"}});
+            }
+            Some("text") | None => {}
+            Some(other) => {
+                return Err(RouterError::invalid(
+                    format!("unsupported response format {other}"),
+                    "response_format",
+                ));
+            }
+        }
+    }
+    Ok(body)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AnthropicThinkingMode {
+    Manual,
+    ManualWithEffort,
+    Adaptive,
+}
+
+fn thinking_mode(model: &str) -> AnthropicThinkingMode {
+    let model = model.to_ascii_lowercase();
+    if model.contains("claude-opus-4-5") {
+        return AnthropicThinkingMode::ManualWithEffort;
+    }
+    if model.contains("claude-haiku-4-5")
+        || model.contains("claude-sonnet-4-5")
+        || model.contains("claude-3")
+        || model.contains("claude-4-0")
+        || model.contains("claude-4-1")
+    {
+        return AnthropicThinkingMode::Manual;
+    }
+    AnthropicThinkingMode::Adaptive
+}
+
+fn reasoning_effort(request: &ChatCompletionRequest) -> Option<&str> {
+    request
+        .reasoning
+        .as_ref()
+        .and_then(|value| value.effort.as_deref())
+        .or(request.reasoning_effort.as_deref())
+}
+
+fn manual_effort_budget(effort: &str) -> Result<u64, RouterError> {
+    match effort {
+        "minimal" | "low" => Ok(1_024),
+        "medium" => Ok(4_096),
+        "high" => Ok(8_192),
+        "xhigh" => Ok(16_384),
+        "max" => Ok(32_768),
+        _ => Err(RouterError::invalid(
+            format!("unsupported Anthropic reasoning effort {effort}"),
+            "reasoning_effort",
+        )),
+    }
+}
+
+fn default_anthropic_max_tokens(model: &str, request: &ChatCompletionRequest) -> u64 {
+    let reasoning = request.reasoning.as_ref();
+    if reasoning.and_then(|value| value.enabled) == Some(false)
+        || reasoning_effort(request) == Some("none")
+    {
+        return 1_024;
+    }
+    if let Some(budget) = reasoning.and_then(|value| value.max_tokens) {
+        return budget.saturating_add(1_024);
+    }
+    if request.reasoning.is_some() || request.reasoning_effort.is_some() {
+        return if thinking_mode(model) == AnthropicThinkingMode::Adaptive {
+            8_192
+        } else {
+            reasoning_effort(request)
+                .map(manual_effort_budget)
+                .transpose()
+                .ok()
+                .flatten()
+                .unwrap_or(4_096)
+                .saturating_add(1_024)
+        };
+    }
+    1_024
+}
+
+fn apply_anthropic_reasoning(
+    model: &str,
+    request: &ChatCompletionRequest,
+    max_tokens: u64,
+    body: &mut Value,
+) -> Result<(), RouterError> {
+    if request.reasoning.is_none() && request.reasoning_effort.is_none() {
+        return Ok(());
+    }
+    let reasoning = request.reasoning.as_ref();
+    let effort = reasoning_effort(request);
+    if reasoning.and_then(|value| value.enabled) == Some(false) || effort == Some("none") {
+        if reasoning.and_then(|value| value.enabled) == Some(false)
+            && effort.is_some_and(|value| value != "none")
+        {
+            return Err(RouterError::invalid(
+                "reasoning.enabled=false conflicts with reasoning effort",
+                "reasoning",
+            ));
+        }
+        body["thinking"] = json!({"type": "disabled"});
+        return Ok(());
+    }
+    if request
+        .temperature
+        .is_some_and(|temperature| (temperature - 1.0).abs() > f64::EPSILON)
+    {
+        return Err(RouterError::invalid(
+            "Anthropic thinking requires temperature 1 or an omitted temperature",
+            "temperature",
+        ));
+    }
+
+    let mode = thinking_mode(model);
+    if let Some(budget) = reasoning.and_then(|value| value.max_tokens) {
+        validate_manual_budget(budget, max_tokens)?;
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+        if let Some(effort) = effort {
+            if mode != AnthropicThinkingMode::ManualWithEffort {
+                return Err(RouterError::invalid(
+                    "this Anthropic model cannot combine reasoning effort with a manual token budget",
+                    "reasoning.effort",
+                ));
+            }
+            manual_effort_budget(effort)?;
+            body["output_config"] = json!({"effort": effort});
+        }
+        return Ok(());
+    }
+
+    if mode == AnthropicThinkingMode::Adaptive {
+        body["thinking"] = json!({"type": "adaptive"});
+        if let Some(effort) = effort {
+            manual_effort_budget(effort)?;
+            body["output_config"] = json!({"effort": effort});
+        }
+        return Ok(());
+    }
+
+    let budget = effort.map_or(Ok(4_096), manual_effort_budget)?;
+    validate_manual_budget(budget, max_tokens)?;
+    body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+    if mode == AnthropicThinkingMode::ManualWithEffort
+        && let Some(effort) = effort
+    {
+        body["output_config"] = json!({"effort": effort});
+    }
+    Ok(())
+}
+
+fn validate_manual_budget(budget: u64, max_tokens: u64) -> Result<(), RouterError> {
+    if budget < 1_024 {
+        return Err(RouterError::invalid(
+            "Anthropic reasoning budget must be at least 1024 tokens",
+            "reasoning.max_tokens",
+        ));
+    }
+    if budget >= max_tokens {
+        return Err(RouterError::invalid(
+            "Anthropic reasoning budget must be less than the output token limit",
+            "reasoning.max_tokens",
+        ));
+    }
+    Ok(())
+}
+
+fn anthropic_message(message: &Message) -> Result<Value, RouterError> {
+    if message.role == "tool" {
+        let id = message.tool_call_id.as_deref().ok_or_else(|| {
+            RouterError::invalid(
+                "tool message requires tool_call_id",
+                "messages.tool_call_id",
+            )
+        })?;
+        let mut content = vec![json!({
+            "type": "tool_result", "tool_use_id": id,
+            "content": message_texts(message)?.join("\n")
+        })];
+        apply_message_cache_control(&mut content, message)?;
+        return Ok(json!({"role": "user", "content": content}));
+    }
+    if message.role == "function" {
+        return Err(RouterError::invalid(
+            "legacy function messages cannot be translated losslessly to Anthropic",
+            "messages.role",
+        ));
+    }
+    let role = if message.role == "assistant" {
+        "assistant"
+    } else {
+        "user"
+    };
+    let regular_content = content_blocks(message)?;
+    let mut content = if role == "assistant" {
+        Vec::new()
+    } else {
+        regular_content.clone()
+    };
+    if role == "assistant" {
+        for detail in &message.reasoning_details {
+            match detail.get("type").and_then(Value::as_str) {
+                Some("reasoning.encrypted") => content.push(json!({
+                    "type": "redacted_thinking", "data": detail.get("data").cloned().unwrap_or(Value::Null)
+                })),
+                Some("reasoning.text") => content.push(json!({
+                    "type": "thinking",
+                    "thinking": detail.get("text").and_then(Value::as_str).unwrap_or_default(),
+                    "signature": detail.get("signature").and_then(Value::as_str).unwrap_or_default()
+                })),
+                _ => return Err(RouterError::invalid(
+                    "unsupported Anthropic reasoning detail",
+                    "messages.reasoning_details",
+                )),
+            }
+        }
+        content.extend(regular_content);
+        for call in &message.tool_calls {
+            let function = call.function.as_ref().ok_or_else(|| {
+                RouterError::invalid(
+                    "function tool call is missing function",
+                    "messages.tool_calls",
+                )
+            })?;
+            let input: Value = serde_json::from_str(&function.arguments).map_err(|error| {
+                RouterError::invalid(
+                    format!("tool arguments are not valid JSON: {error}"),
+                    "messages.tool_calls.function.arguments",
+                )
+            })?;
+            content.push(
+                json!({"type": "tool_use", "id": call.id, "name": function.name, "input": input}),
+            );
+        }
+    }
+    apply_message_cache_control(&mut content, message)?;
+    Ok(json!({"role": role, "content": content}))
+}
+
+fn content_blocks(message: &Message) -> Result<Vec<Value>, RouterError> {
+    let mut blocks = Vec::new();
+    match &message.content {
+        Some(MessageContent::Text(text)) if !text.is_empty() => {
+            blocks.push(json!({"type": "text", "text": text}));
+        }
+        Some(MessageContent::Text(_)) | None => {}
+        Some(MessageContent::Parts(parts)) => {
+            for part in parts {
+                let mut block = match part.kind.as_str() {
+                    "text" => {
+                        json!({"type": "text", "text": part.text.as_deref().unwrap_or_default()})
+                    }
+                    "image_url" => {
+                        let url = &part
+                            .image_url
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RouterError::invalid(
+                                    "image_url part is missing image_url",
+                                    "messages.content.image_url",
+                                )
+                            })?
+                            .url;
+                        media_source("image", url)?
+                    }
+                    "file" => {
+                        let data = part
+                            .file
+                            .as_ref()
+                            .and_then(|file| file.file_data.as_ref())
+                            .ok_or_else(|| {
+                                RouterError::invalid(
+                                    "file part is missing file_data",
+                                    "messages.content.file.file_data",
+                                )
+                            })?;
+                        media_source("document", data)?
+                    }
+                    other => {
+                        return Err(RouterError::invalid(
+                            format!("Anthropic cannot accept {other}"),
+                            "messages.content.type",
+                        ));
+                    }
+                };
+                if let Some(cache_control) = cache_control(&part.extra, "messages.content")? {
+                    block["cache_control"] = cache_control.clone();
+                }
+                blocks.push(block);
+            }
+        }
+    }
+    Ok(blocks)
+}
+
+fn system_content_blocks(message: &Message) -> Result<Vec<Value>, RouterError> {
+    match &message.content {
+        Some(MessageContent::Text(text)) => Ok(vec![json!({"type": "text", "text": text})]),
+        Some(MessageContent::Parts(parts)) => parts
+            .iter()
+            .map(|part| {
+                if part.kind != "text" {
+                    return Err(RouterError::invalid(
+                        "system content must be text for Anthropic",
+                        "messages.content",
+                    ));
+                }
+                let mut block =
+                    json!({"type": "text", "text": part.text.as_deref().unwrap_or_default()});
+                if let Some(cache_control) = cache_control(&part.extra, "messages.content")? {
+                    block["cache_control"] = cache_control.clone();
+                }
+                Ok(block)
+            })
+            .collect(),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn apply_message_cache_control(blocks: &mut [Value], message: &Message) -> Result<(), RouterError> {
+    let Some(cache_control) = cache_control(&message.extra, "messages.cache_control")? else {
+        return Ok(());
+    };
+    let block = blocks.last_mut().ok_or_else(|| {
+        RouterError::invalid(
+            "cache_control requires a non-empty message content block",
+            "messages.cache_control",
+        )
+    })?;
+    block["cache_control"] = cache_control.clone();
+    Ok(())
+}
+
+fn media_source(kind: &str, value: &str) -> Result<Value, RouterError> {
+    if value.starts_with("https://") {
+        return Ok(json!({"type": kind, "source": {"type": "url", "url": value}}));
+    }
+    let (media_type, data) = parse_data_url(value)?;
+    Ok(json!({"type": kind, "source": {"type": "base64", "media_type": media_type, "data": data}}))
+}
+
+fn parse_data_url(value: &str) -> Result<(&str, &str), RouterError> {
+    let payload = value.strip_prefix("data:").ok_or_else(|| {
+        RouterError::invalid("attachment must be HTTPS or a data URL", "messages.content")
+    })?;
+    let (metadata, data) = payload
+        .split_once(',')
+        .ok_or_else(|| RouterError::invalid("malformed data URL", "messages.content"))?;
+    let media_type = metadata.strip_suffix(";base64").ok_or_else(|| {
+        RouterError::invalid("data URL must use base64 encoding", "messages.content")
+    })?;
+    Ok((media_type, data))
+}
+
+fn message_texts(message: &Message) -> Result<Vec<String>, RouterError> {
+    match &message.content {
+        Some(MessageContent::Text(text)) => Ok(vec![text.clone()]),
+        Some(MessageContent::Parts(parts)) => parts
+            .iter()
+            .map(|part| {
+                if part.kind != "text" {
+                    return Err(RouterError::invalid(
+                        "system/tool content must be text for Anthropic",
+                        "messages.content",
+                    ));
+                }
+                Ok(part.text.clone().unwrap_or_default())
+            })
+            .collect(),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn anthropic_tool(tool: &Tool) -> Result<Value, RouterError> {
+    let function = tool
+        .function
+        .as_ref()
+        .ok_or_else(|| RouterError::invalid("Anthropic supports function tools only", "tools"))?;
+    Ok(
+        json!({"name": function.name, "description": function.description, "input_schema": function.parameters}),
+    )
+}
+
+fn anthropic_tool_choice(choice: &Value) -> Result<Value, RouterError> {
+    if let Some(value) = choice.as_str() {
+        return Ok(match value {
+            "auto" => json!({"type": "auto"}),
+            "required" => json!({"type": "any"}),
+            "none" => json!({"type": "none"}),
+            _ => {
+                return Err(RouterError::invalid(
+                    "unsupported tool_choice",
+                    "tool_choice",
+                ));
+            }
+        });
+    }
+    if let Some(name) = choice.pointer("/function/name").and_then(Value::as_str) {
+        return Ok(json!({"type": "tool", "name": name}));
+    }
+    Err(RouterError::invalid(
+        "unsupported tool_choice",
+        "tool_choice",
+    ))
+}
+
+fn copy_number(body: &mut Value, key: &str, value: Option<f64>) {
+    if let Some(number) = value.and_then(serde_json::Number::from_f64) {
+        body[key] = Value::Number(number);
+    }
+}
+
+fn normalize_finish(reason: &str) -> &str {
+    match reason {
+        "tool_use" => "tool_calls",
+        "max_tokens" => "length",
+        "end_turn" | "stop_sequence" => "stop",
+        "refusal" => "content_filter",
+        other => other,
+    }
+}
+
+fn validate_nested_extensions(request: &ChatCompletionRequest) -> Result<(), RouterError> {
+    for message in &request.messages {
+        cache_control(&message.extra, "messages")?;
+        if let Some(MessageContent::Parts(parts)) = &message.content {
+            for part in parts {
+                cache_control(&part.extra, "messages.content")?;
+            }
+        }
+    }
+    if request.tools.iter().any(|tool| !tool.extra.is_empty())
+        || request
+            .reasoning
+            .as_ref()
+            .is_some_and(|value| !value.extra.is_empty())
+        || request
+            .stream_options
+            .as_ref()
+            .is_some_and(|value| !value.extra.is_empty())
+    {
+        return Err(RouterError::invalid(
+            "unsupported Anthropic extension fields",
+            "body",
+        ));
+    }
+    Ok(())
+}
+
+fn cache_control<'a>(
+    extra: &'a BTreeMap<String, Value>,
+    parameter: &str,
+) -> Result<Option<&'a Value>, RouterError> {
+    if let Some(field) = extra.keys().find(|field| field.as_str() != "cache_control") {
+        return Err(RouterError::invalid(
+            format!("Anthropic adapter cannot preserve {field}"),
+            format!("{parameter}.{field}"),
+        ));
+    }
+    let Some(value) = extra.get("cache_control") else {
+        return Ok(None);
+    };
+    let object = value.as_object().ok_or_else(|| {
+        RouterError::invalid(
+            "cache_control must be an object",
+            format!("{parameter}.cache_control"),
+        )
+    })?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !matches!(field.as_str(), "type" | "ttl"))
+    {
+        return Err(RouterError::invalid(
+            format!("unsupported cache_control field {field}"),
+            format!("{parameter}.cache_control.{field}"),
+        ));
+    }
+    if object.get("type").and_then(Value::as_str) != Some("ephemeral") {
+        return Err(RouterError::invalid(
+            "cache_control.type must be ephemeral",
+            format!("{parameter}.cache_control.type"),
+        ));
+    }
+    if let Some(ttl) = object.get("ttl")
+        && !matches!(ttl.as_str(), Some("5m" | "1h"))
+    {
+        return Err(RouterError::invalid(
+            "cache_control.ttl must be 5m or 1h",
+            format!("{parameter}.cache_control.ttl"),
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn reject_unsupported_parameters(request: &ChatCompletionRequest) -> Result<(), RouterError> {
+    let unsupported = [
+        (request.frequency_penalty.is_some(), "frequency_penalty"),
+        (request.presence_penalty.is_some(), "presence_penalty"),
+        (request.logit_bias.is_some(), "logit_bias"),
+        (request.prediction.is_some(), "prediction"),
+        (request.modalities.is_some(), "modalities"),
+        (request.audio.is_some(), "audio"),
+        (request.service_tier.is_some(), "service_tier"),
+        (request.metadata.is_some(), "metadata"),
+        (request.user.is_some(), "user"),
+        (
+            request.parallel_tool_calls == Some(false) && !request.tools.is_empty(),
+            "parallel_tool_calls",
+        ),
+        (
+            request
+                .stream_options
+                .as_ref()
+                .and_then(|value| value.include_obfuscation)
+                .is_some(),
+            "stream_options.include_obfuscation",
+        ),
+    ];
+    if let Some((_, parameter)) = unsupported.into_iter().find(|(present, _)| *present) {
+        return Err(RouterError::invalid(
+            format!("Anthropic adapter cannot preserve {parameter}"),
+            parameter,
+        ));
+    }
+    if request
+        .tools
+        .iter()
+        .any(|tool| tool.function.as_ref().and_then(|function| function.strict) == Some(true))
+    {
+        return Err(RouterError::invalid(
+            "Anthropic adapter cannot guarantee strict function schemas",
+            "tools.function.strict",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use router_protocol::ChatCompletionRequest;
+    use serde_json::json;
+
+    use super::{anthropic_request, validate_nested_extensions};
+
+    #[test]
+    fn current_fable_and_mythos_reject_forced_tools_locally() {
+        for model in ["claude-fable-5-1", "claude-mythos-5-1"] {
+            for choice in [
+                json!("required"),
+                json!({"type":"function","function":{"name":"weather"}}),
+            ] {
+                let request: ChatCompletionRequest = serde_json::from_value(json!({
+                    "model": model, "messages": [{"role":"user","content":"weather"}],
+                    "tool_choice": choice
+                }))
+                .unwrap();
+                let error = anthropic_request(model, &request).unwrap_err();
+                assert_eq!(error.body.param.as_deref(), Some("tool_choice"));
+                assert!(anthropic_request("claude-haiku-4-5", &request).is_ok());
+            }
+            for choice in ["auto", "none"] {
+                let request: ChatCompletionRequest = serde_json::from_value(json!({
+                    "model": model, "messages": [{"role":"user","content":"weather"}],
+                    "tool_choice": choice
+                }))
+                .unwrap();
+                assert_eq!(
+                    anthropic_request(model, &request).unwrap()["tool_choice"]["type"],
+                    choice
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn translates_tool_history_and_reasoning_signature() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "anthropic/test",
+            "messages": [{"role":"assistant","content":"", "reasoning_details":[{
+                "type":"reasoning.text","format":"anthropic-claude-v1","text":"thinking","signature":"opaque"
+            }], "tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Tokyo\"}"}}]}]
+        })).unwrap();
+        let body = anthropic_request("test", &request).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["signature"], "opaque");
+        assert_eq!(body["messages"][0]["content"][1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn translates_openai_compatible_cache_control() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "anthropic/test",
+            "messages": [
+                {"role":"system", "content":"instructions", "cache_control":{"type":"ephemeral"}},
+                {"role":"user", "content":[{
+                    "type":"text", "text":"hello",
+                    "cache_control":{"type":"ephemeral", "ttl":"1h"}
+                }]}
+            ]
+        }))
+        .unwrap();
+        validate_nested_extensions(&request).unwrap();
+        let body = anthropic_request("test", &request).unwrap();
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_message_extension_by_name() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "anthropic/test",
+            "messages": [{"role":"user", "content":"hello", "mystery":true}]
+        }))
+        .unwrap();
+        let error = validate_nested_extensions(&request).unwrap_err();
+        assert_eq!(error.body.param.as_deref(), Some("messages.mystery"));
+    }
+
+    #[test]
+    fn maps_openai_effort_to_manual_thinking_for_haiku_45() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "anthropic/claude-haiku-4-5-20251001",
+            "messages": [{"role":"user", "content":"hello"}],
+            "reasoning_effort": "low",
+            "max_completion_tokens": 2048
+        }))
+        .unwrap();
+        let body = anthropic_request("claude-haiku-4-5-20251001", &request).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 1_024);
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn keeps_effort_native_for_adaptive_thinking_models() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "anthropic/claude-sonnet-4-6",
+            "messages": [{"role":"user", "content":"hello"}],
+            "reasoning_effort": "high",
+            "max_completion_tokens": 8192
+        }))
+        .unwrap();
+        let body = anthropic_request("claude-sonnet-4-6", &request).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn rejects_manual_thinking_budget_without_response_room() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "anthropic/claude-haiku-4-5-20251001",
+            "messages": [{"role":"user", "content":"hello"}],
+            "reasoning_effort": "low",
+            "max_completion_tokens": 1024
+        }))
+        .unwrap();
+        let error = anthropic_request("claude-haiku-4-5-20251001", &request).unwrap_err();
+        assert_eq!(error.body.param.as_deref(), Some("reasoning.max_tokens"));
+    }
+}

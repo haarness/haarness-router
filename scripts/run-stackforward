@@ -1,0 +1,64 @@
+#!/bin/zsh
+set -euo pipefail
+
+script_dir="${0:A:h}"
+router_root="${script_dir:h}"
+local_env="${router_root}/.env"
+secrets_file="${HAARNESS_STACKFORWARD_SECRETS:-/Users/alex/work/stackforward/robowork/robowork-backend-stack/environments/prod/group_vars/all.yml}"
+router_config="${HAARNESS_ROUTER_CONFIG:-${router_root}/config.stackforward.toml}"
+router_profile="${HAARNESS_ROUTER_PROFILE:-release}"
+case "${router_profile}" in
+  dev) profile_directory="debug" ;;
+  release|debugger) profile_directory="${router_profile}" ;;
+  *) echo "HAARNESS_ROUTER_PROFILE must be dev, release, or debugger" >&2; exit 2 ;;
+esac
+router_binary="${router_root}/target/${profile_directory}/haarness-router"
+
+umask 077
+ruby -rsecurerandom -e '
+  path = ARGV.fetch(0)
+  existing = File.file?(path) ? File.readlines(path, chomp: true) : []
+  names = existing.map { |line| line.split("=", 2).first unless line.start_with?("#") }.compact
+  additions = {
+    "HAARNESS_ROUTER_KEY" => SecureRandom.hex(32),
+    "HAARNESS_UI_USERNAME" => "admin",
+    "HAARNESS_UI_PASSWORD" => SecureRandom.hex(24),
+  }.reject { |name, _| names.include?(name) }
+  unless additions.empty?
+    File.open(path, File::WRONLY | File::CREAT | File::APPEND, 0o600) do |file|
+      additions.each { |name, value| file.puts("#{name}=#{value}") }
+    end
+  end
+  File.chmod(0o600, path)
+' "${local_env}"
+
+load_local_default() {
+  local name="$1"
+  local line
+  if (( ${+parameters[$name]} )); then
+    if [[ -n "${(P)name}" ]]; then
+      return
+    fi
+  fi
+  line="$(grep -E "^${name}=" "${local_env}" | tail -n 1)"
+  export "${name}=${line#*=}"
+}
+
+load_local_default HAARNESS_ROUTER_KEY
+load_local_default HAARNESS_UI_USERNAME
+load_local_default HAARNESS_UI_PASSWORD
+
+echo "Local router and Web UI credentials are available in ${local_env} (mode 0600)."
+
+if [[ ! -r "${secrets_file}" ]]; then
+  echo "Stackforward secret YAML is not readable: ${secrets_file}" >&2
+  exit 1
+fi
+
+cd "${router_root}"
+cargo build --profile "${router_profile}" --bin haarness-router --quiet
+exec ruby "${script_dir}/run-stackforward.rb" \
+  "${secrets_file}" \
+  "${router_binary}" \
+  "${router_config}" \
+  "$@"

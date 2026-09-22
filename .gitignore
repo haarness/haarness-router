@@ -1,0 +1,6 @@
+/target
+/.env
+*.pem
+*.key
+live-e2e-report.json
+

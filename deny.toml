@@ -1,0 +1,29 @@
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Transitively required by pdf-extract/lopdf. This is a maintenance
+    # advisory, not a vulnerability, and currently has no safe upgrade.
+    "RUSTSEC-2026-0192",
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

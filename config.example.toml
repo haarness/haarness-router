@@ -1,0 +1,59 @@
+[server]
+bind = "127.0.0.1:8080"
+max_request_bytes = 33554432
+max_concurrent_requests = 20000
+first_byte_timeout_ms = 120000
+drain_seconds = 30
+
+[auth]
+# Use --require-key to require HAARNESS_ROUTER_KEY instead.
+enabled = false
+allow_upstream_key_header = false
+
+# The Web UI is served by the same process at http://127.0.0.1:8080/ui.
+# Set enabled = false for an API-only deployment. For HTTP Basic protection,
+# uncomment both environment-variable references and set those variables.
+[web_ui]
+enabled = true
+path = "/ui"
+# basic_auth_username_env = "HAARNESS_UI_USERNAME"
+# basic_auth_password_env = "HAARNESS_UI_PASSWORD"
+allow_runtime_key_management = true
+max_runtime_keys = 64
+
+[providers.openai]
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+allow_unknown_fields = true
+
+[providers.anthropic]
+kind = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.gemini]
+kind = "gemini"
+api_key_env = "GEMINI_API_KEY"
+
+# Current chat models remain available offline; GET /v1/models also discovers
+# newly released account-visible models automatically (five-minute cache).
+[models."openai/gpt-6-astra"]
+[models."openai/gpt-5.6-sol"]
+[models."openai/gpt-5.6-terra"]
+[models."openai/gpt-5.6-luna"]
+[models."anthropic/claude-fable-5-1"]
+[models."anthropic/claude-opus-5"]
+[models."anthropic/claude-sonnet-5"]
+[models."gemini/gemini-3.8-flash"]
+
+[models."openai/gpt-5-nano"]
+
+[models."anthropic/claude-haiku-4-5-20251001"]
+
+[models."gemini/gemini-3.5-flash-lite"]
+
+[aliases.fast]
+targets = [
+    "openai/gpt-5-nano",
+    "gemini/gemini-3.5-flash-lite",
+    "anthropic/claude-haiku-4-5-20251001",
+]

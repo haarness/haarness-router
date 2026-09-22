@@ -1,0 +1,35 @@
+[package]
+name = "router-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+router-core = { version = "0.1.0", path = "../router-core" }
+router-protocol = { version = "0.1.0", path = "../router-protocol" }
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+router-providers = { version = "0.1.0", path = "../router-providers" }
+tower.workspace = true
+
+[lints]
+workspace = true
