@@ -33,6 +33,23 @@ Undeclared models inherit conservative provider defaults. Declare a model-specif
 
 The model capability object replaces the provider default; include every supported capability. The router derives requirements from each request and never sends a candidate a request it cannot preserve.
 
+Discovery preserves provider metadata and publishes `reasoning_efforts` with
+`supports_reasoning`, tool/image support and token limits. Explicit live metadata
+wins over family defaults. Anthropic's per-level capability flags determine
+native effort choices; manual-thinking models expose budget-backed choices.
+OpenAI's catalog currently omits effort metadata, so documented model-family
+defaults live in `router-providers/src/models.rs`, outside Cloud and the clients.
+Adding a new family requires capability and request-conversion tests; a new
+provider advertising its own effort list needs no Desktop/TUI changes.
+
+Gemini 3 uses `thinkingLevel`, with generation-specific supported values.
+Gemini 2.5 uses `thinkingBudget` (low 2,048, medium 8,192, high 24,576; `none`
+maps to zero only on models that allow disabling thinking). Unsupported levels
+are rejected before contacting Google. See Google's
+[thinking contract](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
+Gemini usage includes both candidate and thought tokens in canonical completion
+tokens; reasoning remains a subset, and cached input is preserved separately.
+
 ### Anthropic reasoning modes
 
 The Anthropic adapter distinguishes manual extended-thinking models from adaptive-thinking models. Claude Haiku/Sonnet 4.5 and earlier models use `thinking.type = "enabled"` with a token budget; Claude 4.6+ defaults to adaptive thinking with native effort. Claude Opus 4.5 keeps manual thinking and can also preserve native effort.
@@ -48,7 +65,7 @@ First decide whether the provider is a profile or a new protocol:
 - An OpenAI-compatible provider normally needs no adapter. Add its typed profile and descriptor (or use `kind = "openai-compatible"` with a configured URL), then declare conservative provider/model capabilities.
 - A genuinely new wire contract gets a new `ProviderProtocol` variant and adapter module. The exhaustive factory match intentionally fails compilation until that protocol has an explicit constructor.
 
-Native adapters must use the shared per-provider transport in `transport.rs`. It creates exactly one pooled HTTP client per configured provider and centralizes connection timeouts, bounded upstream error inspection, and SSE idle policy. Reuse `sse.rs` for bounded framing and `attachment.rs` for attachment fetching/PDF fallback. Provider-specific request conversion and stream-event conversion stay inside the adapter module; they must not leak into `router-server` or the routing/fallback loop.
+Native adapters must use the shared per-provider transport in `transport.rs`. It creates exactly one pooled HTTP client per configured provider and centralizes connection timeouts, bounded upstream error inspection, and SSE idle policy. The routing layer bounds both response-header setup and the first stream event with one deadline, and handles cancellation in both phases without retrying an ambiguous generation. Reuse `sse.rs` for bounded framing and `attachment.rs` for attachment fetching/PDF fallback. Provider-specific request conversion and stream-event conversion stay inside the adapter module; they must not leak into `router-server` or the routing/fallback loop.
 
 Implement `ProviderAdapter` and emit only canonical `ProviderEvent` values. Requirements:
 

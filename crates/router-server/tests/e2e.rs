@@ -122,7 +122,7 @@ async fn mock_gemini(
     state.bodies.lock().unwrap().push(body);
     let sse = concat!(
         "data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[{\"text\":\"gemini\"}]},\"finishReason\":\"STOP\"}],",
-        "\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2,\"totalTokenCount\":5}}\n\n"
+        "\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2,\"thoughtsTokenCount\":4,\"cachedContentTokenCount\":1,\"totalTokenCount\":9}}\n\n"
     );
     Response::builder()
         .status(StatusCode::OK)
@@ -473,7 +473,13 @@ async fn native_gemini_contract_is_isolated_behind_canonical_events() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "gemini");
-    assert_eq!(body["usage"]["total_tokens"], 5);
+    assert_eq!(body["usage"]["total_tokens"], 9);
+    assert_eq!(body["usage"]["completion_tokens"], 6);
+    assert_eq!(
+        body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        4
+    );
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 1);
 
     assert_eq!(
         upstream.credentials.lock().unwrap().as_slice(),

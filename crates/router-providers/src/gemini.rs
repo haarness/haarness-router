@@ -48,6 +48,8 @@ impl ProviderAdapter for GeminiAdapter {
     ) -> Result<EventStream, RouterError> {
         let key = api_key.ok_or_else(|| RouterError::unavailable("provider API key is missing"))?;
         prepare_pdf_fallback(&mut request, capabilities).await?;
+        // The router target, not a public alias, determines thinking syntax.
+        request.model = model.to_owned();
         let body = gemini_request(&request)?;
         let url = format!(
             "{}/models/{model}:streamGenerateContent?alt=sse",
@@ -75,17 +77,7 @@ impl ProviderAdapter for GeminiAdapter {
                     Err(RouterError::upstream(http::StatusCode::BAD_GATEWAY, format!("Gemini stream returned {status}")))?;
                 }
                 if let Some(usage) = event.get("usageMetadata") {
-                    let input = usage.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0);
-                    let output = usage.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0);
-                    yield ProviderEvent::Usage(Usage {
-                        prompt_tokens: input,
-                        completion_tokens: output,
-                        total_tokens: usage.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(input + output),
-                        completion_tokens_details: Some(json!({
-                            "reasoning_tokens": usage.get("thoughtsTokenCount").and_then(Value::as_u64).unwrap_or(0)
-                        })),
-                        ..Usage::default()
-                    });
+                    yield ProviderEvent::Usage(gemini_usage(usage));
                 }
                 let Some(candidates) = event.get("candidates").and_then(Value::as_array) else { continue; };
                 for candidate in candidates {
@@ -143,6 +135,28 @@ impl ProviderAdapter for GeminiAdapter {
                 }
             }
         }))
+    }
+}
+
+fn gemini_usage(usage: &Value) -> Usage {
+    let input = usage["promptTokenCount"].as_u64().unwrap_or(0);
+    let thoughts = usage["thoughtsTokenCount"].as_u64().unwrap_or(0);
+    // Gemini reports thoughts separately from candidates. OpenAI-compatible
+    // completion_tokens includes both, with reasoning_tokens a subset.
+    let output = usage["candidatesTokenCount"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_add(thoughts);
+    Usage {
+        prompt_tokens: input,
+        completion_tokens: output,
+        total_tokens: usage["totalTokenCount"]
+            .as_u64()
+            .unwrap_or(input.saturating_add(output)),
+        prompt_tokens_details: Some(
+            json!({"cached_tokens": usage["cachedContentTokenCount"].as_u64().unwrap_or(0)}),
+        ),
+        completion_tokens_details: Some(json!({"reasoning_tokens": thoughts})),
     }
 }
 
@@ -281,14 +295,54 @@ fn gemini_request(request: &ChatCompletionRequest) -> Result<Value, RouterError>
         let reasoning = request.reasoning.as_ref();
         let mut thinking =
             json!({"includeThoughts": reasoning.and_then(|value| value.exclude) != Some(true)});
-        if let Some(tokens) = reasoning.and_then(|value| value.max_tokens) {
-            thinking["thinkingBudget"] = tokens.into();
+        let effort = reasoning
+            .and_then(|value| value.effort.as_deref())
+            .or(request.reasoning_effort.as_deref());
+        let disabled = reasoning.and_then(|value| value.enabled) == Some(false);
+        if disabled && effort.is_some_and(|value| value != "none") {
+            return Err(RouterError::invalid(
+                "reasoning.enabled=false conflicts with reasoning effort",
+                "reasoning",
+            ));
         }
-        if let Some(effort) = reasoning
-            .and_then(|value| value.effort.as_ref())
-            .or(request.reasoning_effort.as_ref())
-        {
-            thinking["thinkingLevel"] = Value::String(effort.to_ascii_uppercase());
+        let effort = if disabled { Some("none") } else { effort };
+        let budget = reasoning.and_then(|value| value.max_tokens);
+        if budget.is_some() && effort.is_some() {
+            return Err(RouterError::invalid(
+                "choose a reasoning effort or token budget, not both",
+                "reasoning",
+            ));
+        }
+        if let Some(tokens) = budget {
+            thinking["thinkingBudget"] = tokens.into();
+        } else if let Some(effort) = effort {
+            let levels = crate::models::gemini_reasoning_efforts(&request.model);
+            if !levels.is_empty() && !levels.contains(&effort) {
+                return Err(RouterError::invalid(
+                    format!(
+                        "{} does not support reasoning effort {effort}",
+                        request.model
+                    ),
+                    "reasoning_effort",
+                ));
+            }
+            if request.model.starts_with("gemini-2.5") {
+                let budget = match effort {
+                    "none" => 0,
+                    "low" => 2_048,
+                    "medium" => 8_192,
+                    "high" => 24_576,
+                    _ => {
+                        return Err(RouterError::invalid(
+                            "unsupported Gemini reasoning effort",
+                            "reasoning_effort",
+                        ));
+                    }
+                };
+                thinking["thinkingBudget"] = json!(budget);
+            } else {
+                thinking["thinkingLevel"] = Value::String(effort.to_owned());
+            }
         }
         generation["thinkingConfig"] = thinking;
     }
@@ -536,8 +590,70 @@ fn normalize_finish(reason: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use router_protocol::ChatCompletionRequest;
+    use serde_json::json;
 
     use super::gemini_request;
+
+    #[test]
+    fn usage_includes_reasoning_output_and_cached_input() {
+        let usage = super::gemini_usage(
+            &json!({"promptTokenCount": 100, "candidatesTokenCount": 5, "thoughtsTokenCount": 40, "cachedContentTokenCount": 60}),
+        );
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (100, 45, 145)
+        );
+        assert_eq!(usage.prompt_tokens_details.unwrap()["cached_tokens"], 60);
+        assert_eq!(
+            usage.completion_tokens_details.unwrap()["reasoning_tokens"],
+            40
+        );
+        let plain = super::gemini_usage(
+            &json!({"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5}),
+        );
+        assert_eq!(plain.completion_tokens, 2);
+        assert_eq!(plain.total_tokens, 5);
+    }
+
+    #[test]
+    fn every_advertised_gemini_effort_uses_its_generation_contract() {
+        for model in [
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3-pro-preview",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+        ] {
+            for effort in crate::models::gemini_reasoning_efforts(model) {
+                let request = serde_json::from_value(json!({"model":model,"messages":[{"role":"user","content":"hi"}],"reasoning_effort":effort})).unwrap();
+                let body = gemini_request(&request).unwrap();
+                let thinking = &body["generationConfig"]["thinkingConfig"];
+                if model.starts_with("gemini-2.5") {
+                    assert!(thinking["thinkingLevel"].is_null());
+                    assert!(thinking["thinkingBudget"].is_number());
+                } else {
+                    assert_eq!(thinking["thinkingLevel"], effort);
+                    assert!(thinking["thinkingBudget"].is_null());
+                }
+                assert_eq!(thinking["includeThoughts"], true);
+            }
+        }
+        for (model, effort) in [
+            ("gemini-3.8-flash", "minimal"),
+            ("gemini-3-pro-preview", "medium"),
+            ("gemini-2.5-pro", "none"),
+        ] {
+            let request = serde_json::from_value(
+                json!({"model":model,"messages":[],"reasoning_effort":effort}),
+            )
+            .unwrap();
+            assert!(gemini_request(&request).is_err());
+        }
+    }
 
     #[test]
     fn preserves_json_schemas_for_haarness_tools_and_structured_output() {

@@ -324,16 +324,24 @@ impl Router {
                 )));
                 continue;
             }
-            let result = runtime
-                .adapter
-                .stream(
-                    &runtime.model,
-                    request.clone(),
-                    capabilities,
-                    selected_key,
-                    cancel.child_token(),
-                )
-                .await;
+            // The first-event budget includes waiting for HTTP response headers.
+            // An adapter may not yield a stream until headers arrive; timing only
+            // stream.next() lets a busy upstream hold a request indefinitely.
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_millis(self.config.server.first_byte_timeout_ms);
+            let result = tokio::select! {
+                () = cancel.cancelled() => {
+                    runtime.breaker.cancel(circuit_permit);
+                    return Err(RouterError::new(
+                        http::StatusCode::REQUEST_TIMEOUT, "request cancelled", "request_error", "request_cancelled",
+                    ));
+                },
+                result = tokio::time::timeout_at(deadline, runtime.adapter.stream(
+                    &runtime.model, request.clone(), capabilities, selected_key, cancel.child_token(),
+                )) => result.unwrap_or_else(|_| Err(RouterError::timeout(format!(
+                    "provider {} did not produce response headers before the deadline", runtime.provider,
+                )))),
+            };
             let mut stream = match result {
                 Ok(stream) => stream,
                 Err(error)
@@ -352,11 +360,15 @@ impl Router {
                     return Err(error);
                 }
             };
-            let first = tokio::time::timeout(
-                Duration::from_millis(self.config.server.first_byte_timeout_ms),
-                stream.next(),
-            )
-            .await;
+            let first = tokio::select! {
+                () = cancel.cancelled() => {
+                    runtime.breaker.cancel(circuit_permit);
+                    return Err(RouterError::new(
+                        http::StatusCode::REQUEST_TIMEOUT, "request cancelled", "request_error", "request_cancelled",
+                    ));
+                },
+                first = tokio::time::timeout_at(deadline, stream.next()) => first,
+            };
             let first = match first {
                 Ok(Some(Ok(event))) => event,
                 Ok(Some(Err(error)))
@@ -653,6 +665,74 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::AuthStore;
+
+    #[tokio::test]
+    async fn first_event_deadline_and_cancellation_cover_response_headers() {
+        use super::*;
+        struct Waiting {
+            headers: bool,
+        }
+        #[async_trait]
+        impl ProviderAdapter for Waiting {
+            async fn stream(
+                &self,
+                _: &str,
+                _: ChatCompletionRequest,
+                _: crate::Capabilities,
+                _: Option<&SecretString>,
+                _: CancellationToken,
+            ) -> Result<EventStream, RouterError> {
+                if self.headers {
+                    std::future::pending::<()>().await;
+                }
+                Ok(Box::pin(futures::stream::pending()))
+            }
+        }
+        for (headers, cancelled) in [(true, false), (false, false), (true, true), (false, true)] {
+            let config: AppConfig = serde_json::from_value(serde_json::json!({
+                "auth":{"router_key_envs":["TEST_KEY"]},
+                "server":{"first_byte_timeout_ms":if cancelled { 5000 } else { 25 }},
+                "providers":{"slow":{"kind":"openai-compatible","base_url":"https://example.test/v1"}}
+            })).unwrap();
+            let router = Router::with_provider_keys(
+                config,
+                HashMap::from([(
+                    "slow".into(),
+                    Arc::new(Waiting { headers }) as Arc<dyn ProviderAdapter>,
+                )]),
+                HashMap::from([("slow".into(), SecretString::from("fixture-key"))]),
+            )
+            .unwrap();
+            let cancel = CancellationToken::new();
+            if cancelled {
+                let child = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    child.cancel();
+                });
+            }
+            let request = serde_json::from_value(serde_json::json!({"model":"slow/model", "messages":[{"role":"user","content":"hi"}]})).unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), router.route(request, None, cancel))
+                    .await
+                    .expect("headers and first-event waits must both be bounded");
+            let Err(error) = result else {
+                panic!("a waiting provider cannot complete")
+            };
+            assert_eq!(
+                error.body.code,
+                if cancelled {
+                    "request_cancelled"
+                } else {
+                    "upstream_timeout"
+                }
+            );
+            assert!(
+                !error.retryable,
+                "do not duplicate a potentially accepted generation"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn model_refresh_coalesces_and_preserves_last_success_on_failure() {

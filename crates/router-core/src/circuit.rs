@@ -97,6 +97,22 @@ impl CircuitBreaker {
         }
     }
 
+    /// Release a caller-cancelled attempt without treating it as evidence of
+    /// upstream success or failure, including a cancelled half-open probe.
+    pub(crate) fn cancel(&self, permit: CircuitPermit) {
+        let mut state = self.state.lock().expect("circuit lock poisoned");
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if permit.half_open && permit.generation == state.generation {
+            state.half_open_in_flight = false;
+        }
+        if state.failures >= self.failure_threshold
+            && state.in_flight == 0
+            && state.opened_at.is_none()
+        {
+            state.opened_at = Some(Instant::now());
+        }
+    }
+
     pub fn stream_failure(&self) {
         let mut state = self.state.lock().expect("circuit lock poisoned");
         state.failures = state.failures.saturating_add(1);
@@ -140,6 +156,24 @@ mod tests {
         let probe = breaker.allow().unwrap();
         breaker.success(probe);
         assert!(breaker.allow().is_some());
+    }
+
+    #[test]
+    fn cancellation_does_not_reset_failures_or_strand_half_open_probe() {
+        let breaker = CircuitBreaker::new(1, Duration::ZERO);
+        let failed = breaker.allow().unwrap();
+        let cancelled = breaker.allow().unwrap();
+        breaker.failure(failed);
+        breaker.cancel(cancelled);
+        assert!(breaker.is_open());
+        let probe = breaker.allow().unwrap();
+        breaker.cancel(probe);
+        assert!(breaker.is_open());
+        let next = breaker
+            .allow()
+            .expect("cancelled probe must not block the next caller");
+        breaker.success(next);
+        assert!(!breaker.is_open());
     }
 
     #[test]

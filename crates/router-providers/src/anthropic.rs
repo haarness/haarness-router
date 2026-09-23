@@ -256,18 +256,31 @@ enum AnthropicThinkingMode {
 
 fn thinking_mode(model: &str) -> AnthropicThinkingMode {
     let model = model.to_ascii_lowercase();
+    let model = model
+        .rsplit_once('-')
+        .filter(|(_, suffix)| suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(model.as_str(), |(family, _)| family);
     if model.contains("claude-opus-4-5") {
         return AnthropicThinkingMode::ManualWithEffort;
     }
     if model.contains("claude-haiku-4-5")
         || model.contains("claude-sonnet-4-5")
         || model.contains("claude-3")
+        || model.contains("claude-sonnet-4-0")
+        || model == "claude-sonnet-4"
+        || model.contains("claude-opus-4-0")
+        || model == "claude-opus-4"
+        || model.contains("claude-opus-4-1")
         || model.contains("claude-4-0")
         || model.contains("claude-4-1")
     {
         return AnthropicThinkingMode::Manual;
     }
     AnthropicThinkingMode::Adaptive
+}
+
+pub(crate) fn uses_manual_thinking(model: &str) -> bool {
+    thinking_mode(model) != AnthropicThinkingMode::Adaptive
 }
 
 fn reasoning_effort(request: &ChatCompletionRequest) -> Option<&str> {
@@ -858,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_openai_effort_to_manual_thinking_for_haiku_45() {
+    fn maps_openai_effort_to_manual_thinking_for_older_claude_families() {
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "anthropic/claude-haiku-4-5-20251001",
             "messages": [{"role":"user", "content":"hello"}],
@@ -866,10 +879,17 @@ mod tests {
             "max_completion_tokens": 2048
         }))
         .unwrap();
-        let body = anthropic_request("claude-haiku-4-5-20251001", &request).unwrap();
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["thinking"]["budget_tokens"], 1_024);
-        assert!(body.get("output_config").is_none());
+        for model in [
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-opus-4-1-20250805",
+        ] {
+            let body = anthropic_request(model, &request).unwrap();
+            assert_eq!(body["thinking"]["type"], "enabled", "{model}");
+            assert_eq!(body["thinking"]["budget_tokens"], 1_024, "{model}");
+            assert!(body.get("output_config").is_none(), "{model}");
+        }
     }
 
     #[test]
