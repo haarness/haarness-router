@@ -283,7 +283,13 @@ impl Router {
         let mut last_retryable = None;
         let mut capability_failures = Vec::new();
         for target in targets {
-            let runtime = self.target_runtime(&target)?;
+            let mut runtime = self.target_runtime(&target)?;
+            if upstream_override.is_some() {
+                // Customer-key quotas and failures must not trip or heal the shared
+                // system-credential circuit. An override has one exact target;
+                // a request-local breaker avoids unbounded per-secret state.
+                runtime.breaker = Arc::new(CircuitBreaker::new(3, Duration::from_secs(30)));
+            }
             if let Some(affinity) = requirements.affinity
                 && runtime.kind.reasoning_affinity() != Some(affinity)
             {
@@ -665,6 +671,72 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::AuthStore;
+
+    #[tokio::test]
+    async fn customer_key_failures_do_not_poison_shared_provider_circuits() {
+        use super::*;
+        use secrecy::ExposeSecret;
+        struct Keys;
+        #[async_trait]
+        impl ProviderAdapter for Keys {
+            async fn stream(
+                &self,
+                _: &str,
+                _: ChatCompletionRequest,
+                _: crate::Capabilities,
+                key: Option<&SecretString>,
+                _: CancellationToken,
+            ) -> Result<EventStream, RouterError> {
+                if key.is_some_and(|k| k.expose_secret() == "customer-limited") {
+                    return Err(RouterError::upstream(
+                        http::StatusCode::TOO_MANY_REQUESTS,
+                        "provider quota exhausted",
+                    ));
+                }
+                Ok(Box::pin(futures::stream::iter([Ok(
+                    ProviderEvent::TextDelta {
+                        index: 0,
+                        text: "ok".into(),
+                    },
+                )])))
+            }
+        }
+        let config: AppConfig=serde_json::from_value(serde_json::json!({"providers":{"test":{"kind":"openai-compatible","base_url":"https://example.test/v1"}}})).unwrap();
+        let router = Router::with_provider_keys(
+            config,
+            HashMap::from([("test".into(), Arc::new(Keys) as Arc<dyn ProviderAdapter>)]),
+            HashMap::from([("test".into(), SecretString::from("system-key"))]),
+        )
+        .unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(
+            serde_json::json!({"model":"test/model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .unwrap();
+        for _ in 0..5 {
+            assert!(
+                router
+                    .route(
+                        request.clone(),
+                        Some(SecretString::from("customer-limited")),
+                        CancellationToken::new()
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            router
+                .circuit_states()
+                .iter()
+                .all(|(_, state)| *state == CircuitState::Closed)
+        );
+        assert!(
+            router
+                .route(request, None, CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
 
     #[tokio::test]
     async fn first_event_deadline_and_cancellation_cover_response_headers() {
