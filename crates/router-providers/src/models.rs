@@ -28,6 +28,7 @@ pub(crate) async fn discover(
     for _ in 0..10 {
         let mut url = url::Url::parse(&base).ok()?;
         match protocol {
+            ProviderProtocol::BedrockConverse => return None,
             ProviderProtocol::AnthropicMessages => {
                 url.query_pairs_mut().append_pair("limit", "1000");
                 if let Some(cursor) = &cursor {
@@ -48,11 +49,16 @@ pub(crate) async fn discover(
         }
         let request = client.get(url);
         let request = match protocol {
+            ProviderProtocol::BedrockConverse => return None,
             ProviderProtocol::AnthropicMessages => request
                 .header("x-api-key", key.expose_secret())
                 .header("anthropic-version", "2023-06-01"),
             ProviderProtocol::GeminiGenerateContent => {
-                request.header("x-goog-api-key", key.expose_secret())
+                if config.auth_header.as_deref() == Some("authorization") {
+                    request.bearer_auth(key.expose_secret())
+                } else {
+                    request.header("x-goog-api-key", key.expose_secret())
+                }
             }
             ProviderProtocol::OpenAiChatCompletions => {
                 let header = config.auth_header.as_deref().unwrap_or("authorization");

@@ -19,6 +19,7 @@ pub(crate) struct ProviderTransport {
 impl ProviderTransport {
     pub(crate) fn new(config: &ProviderConfig) -> Result<Self, RouterError> {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_nodelay(true)

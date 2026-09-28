@@ -1,5 +1,6 @@
 mod anthropic;
 mod attachment;
+mod bedrock;
 mod gemini;
 mod models;
 mod openai_compatible;
@@ -21,6 +22,7 @@ pub fn build_adapters(config: &AppConfig) -> Result<AdapterMap, RouterError> {
             ProviderProtocol::AnthropicMessages => {
                 Arc::new(anthropic::AnthropicAdapter::new(provider)?)
             }
+            ProviderProtocol::BedrockConverse => Arc::new(bedrock::BedrockAdapter::new(provider)?),
             ProviderProtocol::GeminiGenerateContent => {
                 Arc::new(gemini::GeminiAdapter::new(provider)?)
             }

@@ -17,6 +17,7 @@ use crate::{attachment::prepare_pdf_fallback, sse::request_error, transport::Pro
 pub struct GeminiAdapter {
     transport: ProviderTransport,
     base_url: String,
+    bearer_auth: bool,
 }
 
 impl GeminiAdapter {
@@ -24,6 +25,7 @@ impl GeminiAdapter {
         Ok(Self {
             transport: ProviderTransport::new(config)?,
             base_url: config.effective_base_url()?,
+            bearer_auth: config.auth_header.as_deref() == Some("authorization"),
         })
     }
 }
@@ -55,15 +57,13 @@ impl ProviderAdapter for GeminiAdapter {
             "{}/models/{model}:streamGenerateContent?alt=sse",
             self.base_url.trim_end_matches('/')
         );
-        let response = self
-            .transport
-            .client()
-            .post(url)
-            .header("x-goog-api-key", key.expose_secret())
-            .json(&body)
-            .send()
-            .await
-            .map_err(request_error)?;
+        let request = self.transport.client().post(url);
+        let request = if self.bearer_auth {
+            request.bearer_auth(key.expose_secret())
+        } else {
+            request.header("x-goog-api-key", key.expose_secret())
+        };
+        let response = request.json(&body).send().await.map_err(request_error)?;
         let response = self.transport.checked(response).await?;
         let mut source = self.transport.sse(response, cancel);
         Ok(Box::pin(try_stream! {

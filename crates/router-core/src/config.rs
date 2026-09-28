@@ -273,6 +273,7 @@ pub enum ProviderKind {
     Together,
     Fireworks,
     OpenaiCompatible,
+    AmazonBedrock,
 }
 
 /// The upstream wire contract used by a provider profile.
@@ -286,6 +287,7 @@ pub enum ProviderProtocol {
     OpenAiChatCompletions,
     AnthropicMessages,
     GeminiGenerateContent,
+    BedrockConverse,
 }
 
 #[derive(Clone, Copy)]
@@ -351,6 +353,11 @@ impl ProviderKind {
                 capability_profile: CapabilityProfile::ConservativeOpenAiCompatible,
                 default_base_url: Some("https://api.fireworks.ai/inference/v1"),
             },
+            Self::AmazonBedrock => ProviderDescriptor {
+                protocol: ProviderProtocol::BedrockConverse,
+                capability_profile: CapabilityProfile::ConservativeOpenAiCompatible,
+                default_base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com"),
+            },
             Self::OpenaiCompatible => ProviderDescriptor {
                 protocol: ProviderProtocol::OpenAiChatCompletions,
                 capability_profile: CapabilityProfile::ConservativeOpenAiCompatible,
@@ -386,7 +393,7 @@ impl ProviderKind {
         match self.protocol() {
             ProviderProtocol::AnthropicMessages => Some("anthropic"),
             ProviderProtocol::GeminiGenerateContent => Some("google"),
-            ProviderProtocol::OpenAiChatCompletions => None,
+            ProviderProtocol::OpenAiChatCompletions | ProviderProtocol::BedrockConverse => None,
         }
     }
 }

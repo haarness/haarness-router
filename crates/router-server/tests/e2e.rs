@@ -134,6 +134,9 @@ async fn mock_gemini(
 async fn spawn_native_mock(kind: ProviderKind) -> (String, NativeMockState) {
     let state = NativeMockState::default();
     let application = match kind.protocol() {
+        router_core::ProviderProtocol::BedrockConverse => {
+            panic!("Bedrock uses the event-stream fixture in router-providers")
+        }
         router_core::ProviderProtocol::AnthropicMessages => AxumRouter::new()
             .route("/messages", post(mock_anthropic))
             .with_state(state.clone()),
@@ -1115,4 +1118,48 @@ async fn web_ui_path_is_configurable_and_can_be_disabled() {
         .await
         .unwrap();
     assert_eq!(health.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn vertex_uses_oauth_bearer_without_google_api_key_header() {
+    async fn vertex(headers: HeaderMap) -> Response {
+        assert_eq!(
+            headers[header::AUTHORIZATION],
+            "Bearer native-provider-secret"
+        );
+        assert!(headers.get("x-goog-api-key").is_none());
+        Response::builder().header(header::CONTENT_TYPE,"text/event-stream")
+            .body(Body::from("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"vertex-ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1,\"totalTokenCount\":3}}\n\n")).unwrap()
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            AxumRouter::new().route(
+                "/v1/projects/test/locations/global/publishers/google/models/{model}",
+                post(vertex),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let mut definition = native_provider(
+        ProviderKind::Gemini,
+        format!("http://{addr}/v1/projects/test/locations/global/publishers/google"),
+    );
+    definition.auth_header = Some("authorization".into());
+    definition.auth_scheme = Some("Bearer".into());
+    let config = config(BTreeMap::from([("google-vertex".into(), definition)]));
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(config, adapters, HashMap::new()).unwrap();
+    let app = router_server::app(router_server::AppState::new(
+        router,
+        AuthStore::from_keys(["router-secret"], true),
+    ));
+    let response=app.oneshot(json_chat_request(serde_json::json!({"model":"google-vertex/gemini-test","messages":[{"role":"user","content":"hello"}],"max_tokens":10}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("vertex-ok"));
+    server.abort();
 }
