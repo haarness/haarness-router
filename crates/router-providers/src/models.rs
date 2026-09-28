@@ -6,6 +6,10 @@ use router_protocol::ModelObject;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
+mod bedrock;
+#[cfg(test)]
+mod discovery_tests;
+
 /// Account catalogs are data, not a whitelist for routing. Keep pagination,
 /// response sizes and time bounded, and never forward credentials on redirects.
 pub(crate) async fn discover(
@@ -19,10 +23,18 @@ pub(crate) async fn discover(
         .build()
         .ok()?;
     let protocol = config.kind.protocol();
-    let base = format!(
-        "{}/models",
-        config.effective_base_url().ok()?.trim_end_matches('/')
-    );
+    if protocol == ProviderProtocol::BedrockConverse {
+        return bedrock::discover(&client, config, key).await;
+    }
+    let vertex = vertex_catalog_url(config);
+    let base = if let Some(url) = &vertex {
+        url.to_string()
+    } else {
+        format!(
+            "{}/models",
+            config.effective_base_url().ok()?.trim_end_matches('/')
+        )
+    };
     let mut cursor = None::<String>;
     let mut models = BTreeMap::new();
     for _ in 0..10 {
@@ -74,25 +86,22 @@ pub(crate) async fn discover(
                 request.header(header, value)
             }
         };
-        let response = request.send().await.ok()?.error_for_status().ok()?;
-        let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.ok()?;
-            if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
-                return None;
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let body: Value = serde_json::from_slice(&bytes).ok()?;
-        let rows = body[if protocol == ProviderProtocol::GeminiGenerateContent {
+        let body = read_json(request).await?;
+        let rows = body[if vertex.is_some() {
+            "publisherModels"
+        } else if protocol == ProviderProtocol::GeminiGenerateContent {
             "models"
         } else {
             "data"
         }]
         .as_array()?;
         for entry in rows {
-            if let Some(model) = model_entry(config, entry) {
+            let model = if vertex.is_some() {
+                vertex_model(config, entry)
+            } else {
+                model_entry(config, entry)
+            };
+            if let Some(model) = model {
                 models.insert(model.id.clone(), model);
             }
         }
@@ -114,6 +123,54 @@ pub(crate) async fn discover(
         cursor = Some(next.to_owned());
     }
     None
+}
+
+async fn read_json(request: reqwest::RequestBuilder) -> Option<Value> {
+    let response = request.send().await.ok()?.error_for_status().ok()?;
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn vertex_catalog_url(config: &ProviderConfig) -> Option<url::Url> {
+    if config.kind.protocol() != ProviderProtocol::GeminiGenerateContent
+        || config.auth_header.as_deref() != Some("authorization")
+    {
+        return None;
+    }
+    let mut url = url::Url::parse(&config.effective_base_url().ok()?).ok()?;
+    if !url
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/publishers/google")
+    {
+        return None;
+    }
+    // Model Garden listing is a publisher resource, not a project-scoped inference resource.
+    url.set_path("/v1beta1/publishers/google/models");
+    url.set_query(None);
+    Some(url)
+}
+
+fn vertex_model(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
+    let id = entry["name"]
+        .as_str()?
+        .strip_prefix("publishers/google/models/")?;
+    // Other Model Garden entries require deployment or a different inference protocol.
+    if !id.starts_with("gemini-") || id.contains('/') || id.contains('@') {
+        return None;
+    }
+    model_entry(
+        config,
+        &json!({"name":format!("models/{id}"), "displayName":entry["displayName"].as_str().unwrap_or(id), "supportedGenerationMethods":["generateContent"]}),
+    )
 }
 
 fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
@@ -142,6 +199,7 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
         && (!(id.starts_with("gemini-") || id.starts_with("gemma-"))
             || [
                 "image",
+                "embedding",
                 "tts",
                 "transcribe",
                 "native-audio",

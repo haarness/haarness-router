@@ -28,6 +28,14 @@ impl BedrockAdapter {
 }
 #[async_trait]
 impl ProviderAdapter for BedrockAdapter {
+    async fn discover_models(
+        &self,
+        config: &ProviderConfig,
+        api_key: Option<&SecretString>,
+    ) -> Option<Vec<router_protocol::ModelObject>> {
+        crate::models::discover(config, api_key).await
+    }
+
     async fn stream(
         &self,
         model: &str,
