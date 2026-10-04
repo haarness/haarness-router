@@ -66,13 +66,15 @@ impl ProviderAdapter for AnthropicAdapter {
         let mut source = self.transport.sse(response, cancel);
         Ok(Box::pin(try_stream! {
             let mut thinking = std::collections::HashMap::<u32, String>::new();
-            let mut input_tokens = 0;
+            let mut prompt = PromptUsage::default();
             let mut output_tokens = 0;
             while let Some(event) = source.next().await {
                 let event = event?;
                 match event.get("type").and_then(Value::as_str).unwrap_or_default() {
                     "message_start" => {
-                        input_tokens = event.pointer("/message/usage/input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        if let Some(usage) = event.pointer("/message/usage") {
+                            prompt.update(usage);
+                        }
                     }
                     "content_block_start" => {
                         let block_index = event
@@ -141,12 +143,11 @@ impl ProviderAdapter for AnthropicAdapter {
                     }
                     "message_delta" => {
                         output_tokens = event.pointer("/usage/output_tokens").and_then(Value::as_u64).unwrap_or(output_tokens);
-                        yield ProviderEvent::Usage(Usage {
-                            prompt_tokens: input_tokens,
-                            completion_tokens: output_tokens,
-                            total_tokens: input_tokens + output_tokens,
-                            ..Usage::default()
-                        });
+                        // Newer API versions repeat the (cumulative) prompt counters here.
+                        if let Some(usage) = event.get("usage") {
+                            prompt.update(usage);
+                        }
+                        yield ProviderEvent::Usage(prompt.usage(output_tokens));
                         if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
                             yield ProviderEvent::Finish { index: 0, reason: normalize_finish(reason).into() };
                         }
@@ -159,6 +160,57 @@ impl ProviderAdapter for AnthropicAdapter {
                 }
             }
         }))
+    }
+}
+
+/// Anthropic's prompt counters. `input_tokens` excludes both cache reads and cache writes, which are billed at their
+/// own rates (reads at 0.1×, five-minute writes at 1.25× and one-hour writes at 2× the input price), so all three are
+/// kept and reported the way the Bedrock adapter does: `prompt_tokens` counts every prompt token, and
+/// `prompt_tokens_details` says how many were read from (`cached_tokens`) and written to
+/// (`cache_creation_input_tokens`, of which `cache_creation_1h_input_tokens` with a one-hour TTL) the cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PromptUsage {
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cache_write_1h: u64,
+}
+
+impl PromptUsage {
+    fn update(&mut self, usage: &Value) {
+        let count = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64);
+        if let Some(input) = count("/input_tokens") {
+            self.input = input;
+        }
+        if let Some(read) = count("/cache_read_input_tokens") {
+            self.cache_read = read;
+        }
+        if let Some(written) = count("/cache_creation_input_tokens") {
+            self.cache_write = written;
+        }
+        if let Some(one_hour) = count("/cache_creation/ephemeral_1h_input_tokens") {
+            self.cache_write_1h = one_hour.min(self.cache_write);
+        }
+    }
+
+    fn usage(self, output_tokens: u64) -> Usage {
+        let prompt_tokens = self
+            .input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write);
+        Usage {
+            prompt_tokens,
+            completion_tokens: output_tokens,
+            total_tokens: prompt_tokens.saturating_add(output_tokens),
+            prompt_tokens_details: (self.cache_read > 0 || self.cache_write > 0).then(|| {
+                json!({
+                    "cached_tokens": self.cache_read,
+                    "cache_creation_input_tokens": self.cache_write,
+                    "cache_creation_1h_input_tokens": self.cache_write_1h,
+                })
+            }),
+            completion_tokens_details: None,
+        }
     }
 }
 
@@ -792,7 +844,7 @@ mod tests {
     use router_protocol::ChatCompletionRequest;
     use serde_json::json;
 
-    use super::{anthropic_request, validate_nested_extensions};
+    use super::{PromptUsage, anthropic_request, validate_nested_extensions};
 
     #[test]
     fn current_fable_and_mythos_reject_forced_tools_locally() {
@@ -917,5 +969,37 @@ mod tests {
         .unwrap();
         let error = anthropic_request("claude-haiku-4-5-20251001", &request).unwrap_err();
         assert_eq!(error.body.param.as_deref(), Some("reasoning.max_tokens"));
+    }
+
+    #[test]
+    fn prompt_usage_counts_cache_reads_and_writes() {
+        let mut prompt = PromptUsage::default();
+        prompt.update(&serde_json::json!({
+            "input_tokens": 10,
+            "cache_read_input_tokens": 1_000,
+            "cache_creation_input_tokens": 300,
+            "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200}
+        }));
+        let usage = prompt.usage(7);
+        assert_eq!(
+            usage.prompt_tokens, 1_310,
+            "input_tokens excludes cache reads and writes"
+        );
+        assert_eq!(usage.total_tokens, 1_317);
+        let details = usage.prompt_tokens_details.unwrap();
+        assert_eq!(details["cached_tokens"], 1_000);
+        assert_eq!(details["cache_creation_input_tokens"], 300);
+        assert_eq!(details["cache_creation_1h_input_tokens"], 200);
+
+        // A later message_delta repeating only some counters keeps the others.
+        prompt.update(&serde_json::json!({"output_tokens": 9, "input_tokens": 10}));
+        assert_eq!(prompt.usage(9).prompt_tokens, 1_310);
+
+        // Without caching nothing changes for clients.
+        let mut plain = PromptUsage::default();
+        plain.update(&serde_json::json!({"input_tokens": 4}));
+        let usage = plain.usage(2);
+        assert_eq!((usage.prompt_tokens, usage.total_tokens), (4, 6));
+        assert!(usage.prompt_tokens_details.is_none());
     }
 }

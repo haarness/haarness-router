@@ -94,7 +94,7 @@ async fn mock_anthropic(
     );
     state.bodies.lock().unwrap().push(body);
     let sse = concat!(
-        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":4}}}\n\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":4,\"cache_read_input_tokens\":6,\"cache_creation_input_tokens\":5}}}\n\n",
         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"claude\"}}\n\n",
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
@@ -434,7 +434,14 @@ async fn native_anthropic_contract_is_isolated_behind_canonical_events() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "claude");
-    assert_eq!(body["usage"]["total_tokens"], 6);
+    // Anthropic's input_tokens excludes cache reads and writes: the prompt is 4 + 6 + 5.
+    assert_eq!(body["usage"]["prompt_tokens"], 15);
+    assert_eq!(body["usage"]["total_tokens"], 17);
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 6);
+    assert_eq!(
+        body["usage"]["prompt_tokens_details"]["cache_creation_input_tokens"],
+        5
+    );
 
     assert_eq!(
         upstream.credentials.lock().unwrap().as_slice(),
