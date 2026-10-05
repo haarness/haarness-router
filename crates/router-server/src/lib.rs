@@ -307,6 +307,8 @@ fn streaming_response(
                     let _ = usage;
                     continue;
                 }
+                // Internal: only the final usage reaches clients.
+                Ok(ProviderEvent::PromptUsage(_)) => continue,
                 Ok(ProviderEvent::ReasoningDelta { .. }) if exclude_reasoning => continue,
                 Ok(event) => chunk_for_event(&response_id, &model, created, event, &mut announced),
                 Err(error) => {
@@ -401,6 +403,9 @@ async fn nonstream_response(
                 }
             }
             ProviderEvent::Usage(value) => usage = Some(value),
+            ProviderEvent::PromptUsage(value) => {
+                usage.get_or_insert(value);
+            }
             ProviderEvent::Finish { index, reason } => {
                 choices.entry(index).or_default().finish_reason = reason;
             }
@@ -553,6 +558,8 @@ fn chunk_for_event(
             json!([]),
             serde_json::to_value(usage).unwrap_or(Value::Null),
         ),
+        // The stream skips it; an empty chunk if it ever arrives here.
+        ProviderEvent::PromptUsage(_) => base(json!([]), Value::Null),
         ProviderEvent::Finish { index, reason } => base(
             json!([{
                 "index": index, "delta": {}, "finish_reason": reason, "logprobs": null

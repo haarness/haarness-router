@@ -74,6 +74,9 @@ impl ProviderAdapter for AnthropicAdapter {
                     "message_start" => {
                         if let Some(usage) = event.pointer("/message/usage") {
                             prompt.update(usage);
+                            output_tokens = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                            // Billed from here on, whatever happens to the stream.
+                            yield ProviderEvent::PromptUsage(prompt.usage(output_tokens));
                         }
                     }
                     "content_block_start" => {

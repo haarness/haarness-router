@@ -50,6 +50,12 @@ pub enum ProviderEvent {
         arguments: Option<String>,
     },
     Usage(Usage),
+    /// The prompt's size as the provider reports it when it starts the
+    /// response (Anthropic `message_start`): input and cache counts, output
+    /// so far. The final `Usage` supersedes it; it exists so a stream cut
+    /// before that report is still billed from the provider's own counts.
+    /// Never forwarded to clients.
+    PromptUsage(Usage),
     Finish {
         index: u32,
         reason: String,

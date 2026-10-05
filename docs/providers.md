@@ -72,6 +72,9 @@ Implement `ProviderAdapter` and emit only canonical `ProviderEvent` values. Requ
 1. Check the HTTP status before exposing a stream and mark only explicit 408/429/5xx or safe connection failures retryable.
 2. Parse arbitrarily fragmented SSE with the shared bounded parser.
 3. Preserve choice indexes, incremental tool arguments, finish reasons, usage, and opaque reasoning signatures.
+   When a provider reports the prompt before the final usage (Anthropic `message_start`), emit it as
+   `ProviderEvent::PromptUsage` so a cut stream can still be billed from the provider's own counts; the
+   server never forwards it to clients, which see only the final `Usage`.
 4. Reject every accepted public field that cannot be represented upstream. Never ignore it.
 5. Do not include provider response bodies, prompts, tool arguments, or credentials in errors or traces.
 6. Add request-conversion, stream-fixture, continuation-signature, malformed-input, and black-box tests.

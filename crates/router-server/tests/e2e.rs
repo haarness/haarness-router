@@ -403,6 +403,45 @@ async fn streams_openai_chunks_usage_and_done_marker() {
 }
 
 #[tokio::test]
+async fn anthropic_prompt_usage_reaches_billing_but_never_the_client() {
+    let (base_url, _upstream) = spawn_native_mock(ProviderKind::Anthropic).await;
+    let config = config(BTreeMap::from([(
+        "anthropic".into(),
+        native_provider(ProviderKind::Anthropic, base_url),
+    )]));
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(config, adapters, HashMap::new()).unwrap();
+    let app = router_server::app(router_server::AppState::new(
+        router,
+        AuthStore::from_keys(["router-secret"], true),
+    ));
+    let response = app
+        .oneshot(json_chat_request(serde_json::json!({
+            "model": "anthropic/claude-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    // message_start's prompt counts are an internal event: the client sees one
+    // usage chunk, the final one, with the output.
+    let usages: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter(|chunk| !chunk["usage"].is_null())
+        .map(|chunk| chunk["usage"].clone())
+        .collect();
+    assert_eq!(usages.len(), 1, "{body}");
+    assert_eq!(usages[0]["prompt_tokens"], 15);
+    assert_eq!(usages[0]["completion_tokens"], 2);
+}
+
+#[tokio::test]
 async fn native_anthropic_contract_is_isolated_behind_canonical_events() {
     let (base_url, upstream) = spawn_native_mock(ProviderKind::Anthropic).await;
     let config = config(BTreeMap::from([(
