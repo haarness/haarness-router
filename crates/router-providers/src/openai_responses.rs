@@ -20,6 +20,14 @@ pub(crate) fn required(model: &str, request: &ChatCompletionRequest) -> bool {
     }) || model.contains("-codex")
         || model.ends_with("-pro")
         || model.contains("-pro-20")
+        // Chat Completions refuses function tools alongside reasoning for
+        // GPT-5 models (HTTP 400); the Responses API serves both.
+        || (model.starts_with("gpt-5")
+            && !request.tools.is_empty()
+            && request
+                .reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| effort != "none"))
         || request
             .messages
             .iter()
@@ -314,5 +322,27 @@ mod tests {
         assert!(required("gpt-6-astra", &request));
         assert!(required("gpt-5.6-luna", &request));
         assert!(required("gpt-7-future", &request));
+    }
+
+    #[test]
+    fn gpt_5_tools_with_reasoning_use_responses() {
+        let request = |effort: Option<&str>, tools: bool| -> ChatCompletionRequest {
+            let mut body =
+                json!({"model":"openai/gpt-5.4-nano","messages":[{"role":"user","content":"hi"}]});
+            if let Some(effort) = effort {
+                body["reasoning_effort"] = json!(effort);
+            }
+            if tools {
+                body["tools"] = json!([{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]);
+            }
+            serde_json::from_value(body).unwrap()
+        };
+        assert!(required("gpt-5.4-nano", &request(Some("low"), true)));
+        assert!(required("gpt-5.5", &request(Some("high"), true)));
+        // Chat Completions still serves the rest of GPT-5.
+        assert!(!required("gpt-5.4-nano", &request(Some("none"), true)));
+        assert!(!required("gpt-5.4-nano", &request(Some("low"), false)));
+        assert!(!required("gpt-5.4-nano", &request(None, true)));
+        assert!(!required("gpt-4.1", &request(Some("low"), true)));
     }
 }
