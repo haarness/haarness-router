@@ -52,16 +52,16 @@ impl ProviderAdapter for AnthropicAdapter {
         prepare_pdf_fallback(&mut request, capabilities).await?;
         let key = api_key.ok_or_else(|| RouterError::unavailable("provider API key is missing"))?;
         let body = anthropic_request(model, &request)?;
-        let response = self
+        let mut builder = self
             .transport
             .client()
             .post(&self.endpoint)
             .header("x-api-key", key.expose_secret())
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await
-            .map_err(request_error)?;
+            .header("anthropic-version", "2023-06-01");
+        if body.pointer("/thinking/block_binding").is_some() {
+            builder = builder.header("anthropic-beta", THINKING_BINDING_BETA);
+        }
+        let response = builder.json(&body).send().await.map_err(request_error)?;
         let response = self.transport.checked(response).await?;
         let mut source = self.transport.sse(response, cancel);
         Ok(Box::pin(try_stream! {
@@ -251,8 +251,10 @@ fn anthropic_request(model: &str, request: &ChatCompletionRequest) -> Result<Val
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    copy_number(&mut body, "temperature", request.temperature);
-    copy_number(&mut body, "top_p", request.top_p);
+    if accepts_sampling(model) {
+        copy_number(&mut body, "temperature", request.temperature);
+        copy_number(&mut body, "top_p", request.top_p);
+    }
     if let Some(stop) = &request.stop {
         body["stop_sequences"] = match stop {
             Value::String(value) => json!([value]),
@@ -261,7 +263,7 @@ fn anthropic_request(model: &str, request: &ChatCompletionRequest) -> Result<Val
     }
     if let Some(choice) = &request.tool_choice {
         body["tool_choice"] = anthropic_tool_choice(choice)?;
-        if (model.starts_with("claude-fable-5-1") || model.starts_with("claude-mythos-5-1"))
+        if rejects_forced_tool_choice(model)
             && matches!(body["tool_choice"]["type"].as_str(), Some("tool" | "any"))
         {
             return Err(RouterError::invalid(
@@ -338,6 +340,56 @@ pub(crate) fn uses_manual_thinking(model: &str) -> bool {
     thinking_mode(model) != AnthropicThinkingMode::Adaptive
 }
 
+/// Claude's generation as `[major, minor]` from ids such as `claude-opus-4-7`,
+/// `claude-haiku-5-5` or `claude-3-5-sonnet-20241022`; snapshot dates are ignored.
+fn claude_generation(model: &str) -> Vec<u64> {
+    model
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty() && part.len() <= 2)
+        .filter_map(|part| part.parse().ok())
+        .take(2)
+        .collect()
+}
+
+/// Claude 4.7 and later answer 400 ("deprecated for this model") to
+/// `temperature` and `top_p`, so OpenAI-style defaults are left out for them.
+fn accepts_sampling(model: &str) -> bool {
+    !model.to_ascii_lowercase().contains("claude")
+        || !matches!(
+            claude_generation(model).as_slice(),
+            [5..=99, ..] | [4, 7..=99, ..]
+        )
+}
+
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// Models whose thinking blocks stay valid only while everything before them is
+/// unchanged (Anthropic's preserved-thinking page, 2026-10-10).
+fn prefix_bound_thinking(model: &str) -> bool {
+    [
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+}
+
+/// Models that answer 400 to `tool_choice` `any` or `tool` (checked 2026-10-10;
+/// Sonnet 5 and Haiku 5.5 still accept them).
+fn rejects_forced_tool_choice(model: &str) -> bool {
+    [
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+}
+
 fn reasoning_effort(request: &ChatCompletionRequest) -> Option<&str> {
     request
         .reasoning
@@ -409,9 +461,10 @@ fn apply_anthropic_reasoning(
         body["thinking"] = json!({"type": "disabled"});
         return Ok(());
     }
-    if request
-        .temperature
-        .is_some_and(|temperature| (temperature - 1.0).abs() > f64::EPSILON)
+    if accepts_sampling(model)
+        && request
+            .temperature
+            .is_some_and(|temperature| (temperature - 1.0).abs() > f64::EPSILON)
     {
         return Err(RouterError::invalid(
             "Anthropic thinking requires temperature 1 or an omitted temperature",
@@ -437,7 +490,13 @@ fn apply_anthropic_reasoning(
     }
 
     if mode == AnthropicThinkingMode::Adaptive {
-        body["thinking"] = json!({"type": "adaptive"});
+        // Without `display`, adaptive thinking comes back as empty blocks.
+        body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+        if prefix_bound_thinking(model) {
+            // A changed prompt or tool list retires the invalidated thinking
+            // instead of failing the conversation with a 400.
+            body["thinking"]["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
+        }
         if let Some(effort) = effort {
             manual_effort_budget(effort)?;
             body["output_config"] = json!({"effort": effort});
@@ -851,7 +910,12 @@ mod tests {
 
     #[test]
     fn current_fable_and_mythos_reject_forced_tools_locally() {
-        for model in ["claude-fable-5-1", "claude-mythos-5-1"] {
+        for model in [
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+        ] {
             for choice in [
                 json!("required"),
                 json!({"type":"function","function":{"name":"weather"}}),
@@ -864,6 +928,7 @@ mod tests {
                 let error = anthropic_request(model, &request).unwrap_err();
                 assert_eq!(error.body.param.as_deref(), Some("tool_choice"));
                 assert!(anthropic_request("claude-haiku-4-5", &request).is_ok());
+                assert!(anthropic_request("claude-haiku-5-5", &request).is_ok());
             }
             for choice in ["auto", "none"] {
                 let request: ChatCompletionRequest = serde_json::from_value(json!({
@@ -877,6 +942,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn leaves_out_sampling_that_new_claude_models_reject() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/claude-haiku-5-5", "messages": [{"role":"user","content":"hi"}],
+            "temperature": 0.2, "top_p": 0.9, "reasoning_effort": "low"
+        }))
+        .unwrap();
+        for model in [
+            "claude-haiku-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+            "claude-opus-4-7",
+        ] {
+            let body = anthropic_request(model, &request).unwrap();
+            assert!(body.get("temperature").is_none(), "{model}");
+            assert!(body.get("top_p").is_none(), "{model}");
+            assert_eq!(body["thinking"]["type"], "adaptive", "{model}");
+        }
+        let plain: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/claude-sonnet-4-6", "messages": [{"role":"user","content":"hi"}],
+            "temperature": 0.2, "top_p": 0.9
+        }))
+        .unwrap();
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            let body = anthropic_request(model, &plain).unwrap();
+            assert_eq!(body["temperature"], 0.2, "{model}");
+            assert_eq!(body["top_p"], 0.9, "{model}");
+        }
+        // Older families still refuse a non-default temperature with thinking.
+        let thinking: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/claude-sonnet-4-6", "messages": [{"role":"user","content":"hi"}],
+            "temperature": 0.2, "reasoning_effort": "low", "max_completion_tokens": 8192
+        }))
+        .unwrap();
+        assert!(anthropic_request("claude-sonnet-4-6", &thinking).is_err());
     }
 
     #[test]
@@ -958,7 +1064,16 @@ mod tests {
         .unwrap();
         let body = anthropic_request("claude-sonnet-4-6", &request).unwrap();
         assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert!(body["thinking"].get("block_binding").is_none());
         assert_eq!(body["output_config"]["effort"], "high");
+        for model in ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"] {
+            let body = anthropic_request(model, &request).unwrap();
+            assert_eq!(
+                body["thinking"]["block_binding"]["prefix_mismatch_behavior"], "drop_block",
+                "{model}"
+            );
+        }
     }
 
     #[test]

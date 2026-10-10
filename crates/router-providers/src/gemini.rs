@@ -260,7 +260,16 @@ fn gemini_request(request: &ChatCompletionRequest) -> Result<Value, RouterError>
         body["tools"] = json!([{"functionDeclarations": declarations}]);
     }
     if let Some(choice) = &request.tool_choice {
-        body["toolConfig"] = json!({"functionCallingConfig": gemini_tool_choice(choice)?});
+        let config = gemini_tool_choice(choice)?;
+        if config["mode"] == "ANY"
+            && let Some(declarations) = body.pointer_mut("/tools/0/functionDeclarations")
+        {
+            // Forced calling compiles each schema into a decoding grammar, and
+            // Gemini answers 400 "invalid argument" to an array bound over
+            // complex items (e.g. 100 `anyOf` objects); clients validate calls.
+            strip_max_items(declarations);
+        }
+        body["toolConfig"] = json!({"functionCallingConfig": config});
     }
     let mut generation = json!({});
     if let Some(value) = request.max_completion_tokens.or(request.max_tokens) {
@@ -485,6 +494,17 @@ fn message_text(message: &Message) -> String {
     }
 }
 
+fn strip_max_items(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("maxItems");
+            object.values_mut().for_each(strip_max_items);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_max_items),
+        _ => {}
+    }
+}
+
 fn gemini_tool_choice(choice: &Value) -> Result<Value, RouterError> {
     if let Some(value) = choice.as_str() {
         return Ok(match value {
@@ -679,6 +699,33 @@ mod tests {
         assert_eq!(declaration["parametersJsonSchema"], schema);
         assert!(declaration.get("parameters").is_none());
         assert_eq!(body["generationConfig"]["responseJsonSchema"], schema);
+    }
+
+    #[test]
+    fn forced_tool_calls_leave_out_array_bounds_gemini_cannot_compile() {
+        let schema = serde_json::json!({"type":"object","properties":{"fields":{
+            "type":"array","maxItems":100,"minItems":1,"items":{"anyOf":[{"type":"object"}]}
+        }}});
+        for (choice, stripped) in [
+            (serde_json::json!("required"), true),
+            (
+                serde_json::json!({"type":"function","function":{"name":"fill"}}),
+                true,
+            ),
+            (serde_json::json!("auto"), false),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"gemini/test", "messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"fill","parameters":schema}}],
+                "tool_choice": choice
+            }))
+            .unwrap();
+            let body = gemini_request(&request).unwrap();
+            let fields = &body["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"]["properties"]
+                ["fields"];
+            assert_eq!(fields.get("maxItems").is_none(), stripped, "{choice}");
+            assert_eq!(fields["minItems"], 1);
+        }
     }
 
     #[test]

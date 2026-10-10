@@ -199,6 +199,8 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
         && (!(id.starts_with("gemini-") || id.starts_with("gemma-"))
             || [
                 "image",
+                // Image models named after the brand, e.g. gemini-nano-banana-2.1.
+                "nano-banana",
                 "embedding",
                 "tts",
                 "transcribe",
@@ -345,6 +347,8 @@ mod tests {
         let config: ProviderConfig = serde_json::from_value(json!({"kind":"openai"})).unwrap();
         for (id, expected) in [
             ("gpt-6-astra", vec!["low", "medium", "high", "xhigh", "max"]),
+            // Probed 2026-10-10: GPT-6.1 Sol answers 400 to `none`.
+            ("gpt-6.1-sol", vec!["low", "medium", "high", "xhigh", "max"]),
             (
                 "gpt-6-sol",
                 vec!["none", "low", "medium", "high", "xhigh", "max"],
@@ -446,7 +450,16 @@ mod tests {
             model.metadata["reasoning_efforts"],
             json!(["low", "medium", "high"])
         );
-        assert!(model_entry(&config, &json!({"name":"models/veo-future","supportedGenerationMethods":["generateContent"]})).is_none());
+        for id in [
+            "veo-future",
+            "gemini-nano-banana-2.1",
+            "gemini-3.1-flash-image",
+        ] {
+            assert!(
+                model_entry(&config, &json!({"name":format!("models/{id}"),"supportedGenerationMethods":["generateContent"]})).is_none(),
+                "{id}"
+            );
+        }
         assert!(model_entry(&config, &json!({"name":"models/gemini-embedding-2","supportedGenerationMethods":["embedContent"]})).is_none());
     }
 }
@@ -467,7 +480,7 @@ fn gpt5_minor(id: &str) -> Option<u32> {
 
 /// Reasoning tiers the public Responses API accepts per OpenAI model family,
 /// lightest first. GPT-5.1 replaced `minimal` with `none`, 5.2 added `xhigh`,
-/// 5.6 added `max`, GPT-6 Astra dropped `none`; Sol/Luna retain it. Codex, Pro and chat variants keep
+/// 5.6 added `max`, GPT-6 Astra and GPT-6.1 Sol dropped `none`; GPT-6 Sol/Luna retain it. Codex, Pro and chat variants keep
 /// their own narrower sets. A request outside the set is a 400.
 fn openai_reasoning_efforts(id: &str) -> Vec<&'static str> {
     let lower = id.to_ascii_lowercase();

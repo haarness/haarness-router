@@ -507,6 +507,7 @@ async fn reasoning(
         "claude-mythos-",
         "claude-opus-5",
         "claude-sonnet-5",
+        "claude-haiku-5",
     ]
     .iter()
     .any(|family| model.contains(family));
