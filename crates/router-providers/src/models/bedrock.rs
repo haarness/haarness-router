@@ -1,5 +1,5 @@
 //! Account model discovery through the Bedrock control-plane APIs, using only the supplied key.
-use super::*;
+use super::{BTreeMap, ExposeSecret, ModelObject, ProviderConfig, SecretString, Value, json};
 
 pub(super) fn control_url(config: &ProviderConfig) -> Option<url::Url> {
     let mut url = url::Url::parse(&format!(
@@ -8,10 +8,10 @@ pub(super) fn control_url(config: &ProviderConfig) -> Option<url::Url> {
     ))
     .ok()?;
     let host = url.host_str()?.to_owned();
-    if let Some(region) = host.strip_prefix("bedrock-runtime.") {
-        if region.ends_with(".amazonaws.com") || region.ends_with(".amazonaws.com.cn") {
-            url.set_host(Some(&format!("bedrock.{region}"))).ok()?;
-        }
+    if let Some(region) = host.strip_prefix("bedrock-runtime.")
+        && (region.ends_with(".amazonaws.com") || region.ends_with(".amazonaws.com.cn"))
+    {
+        url.set_host(Some(&format!("bedrock.{region}"))).ok()?;
     }
     Some(url)
 }

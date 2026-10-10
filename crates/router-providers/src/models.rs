@@ -338,6 +338,96 @@ fn openai_chat_model(id: &str) -> bool {
         .any(|part| id.contains(part))
 }
 
+fn gpt5_minor(id: &str) -> Option<u32> {
+    let rest = id.strip_prefix("gpt-5")?;
+    let digits: String = rest
+        .strip_prefix(['.', '-'])?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    // A four-digit hyphenated suffix starts a snapshot date, not a minor version.
+    if rest.starts_with('-') && digits.len() == 4 {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Reasoning tiers the public Responses API accepts per `OpenAI` model family,
+/// lightest first. GPT-5.1 replaced `minimal` with `none`, 5.2 added `xhigh`,
+/// 5.6 added `max`, GPT-6 Astra and GPT-6.1 Sol dropped `none`; GPT-6 Sol/Luna retain it. Codex, Pro and chat variants keep
+/// their own narrower sets. A request outside the set is a 400.
+fn openai_reasoning_efforts(id: &str) -> Vec<&'static str> {
+    let lower = id.to_ascii_lowercase();
+    // A fine-tune is `ft:<family>:<org>:<suffix>`; only the family matters.
+    let family = lower.strip_prefix("ft:").unwrap_or(&lower);
+    let family = family.split(':').next().unwrap_or(family);
+    let segment = |name: &str| family.split(['-', '.']).any(|part| part == name);
+    if family.contains("deep-research") {
+        return vec!["medium"];
+    }
+    if family.starts_with("gpt-6") {
+        if family.starts_with("gpt-6-sol") || family.starts_with("gpt-6-luna") {
+            return vec!["none", "low", "medium", "high", "xhigh", "max"];
+        }
+        return vec!["low", "medium", "high", "xhigh", "max"];
+    }
+    if !family.starts_with("gpt-5") {
+        return if ["o1", "o3", "o4"]
+            .iter()
+            .any(|prefix| family.starts_with(prefix))
+        {
+            vec!["low", "medium", "high"]
+        } else {
+            Vec::new()
+        };
+    }
+    let minor = gpt5_minor(family);
+    if segment("chat") {
+        return Vec::new();
+    }
+    if segment("pro") {
+        return if minor.is_some() {
+            vec!["medium", "high", "xhigh"]
+        } else {
+            vec!["high"]
+        };
+    }
+    if segment("codex") {
+        return match minor {
+            Some(version) if version >= 3 => vec!["none", "low", "medium", "high", "xhigh"],
+            Some(version) if version >= 2 => vec!["low", "medium", "high", "xhigh"],
+            _ if family.contains("codex-max") => vec!["low", "medium", "high", "xhigh"],
+            _ => vec!["low", "medium", "high"],
+        };
+    }
+    match minor {
+        None => vec!["minimal", "low", "medium", "high"],
+        Some(1) => vec!["none", "low", "medium", "high"],
+        Some(version) if version >= 6 => vec!["none", "low", "medium", "high", "xhigh", "max"],
+        Some(_) => vec!["none", "low", "medium", "high", "xhigh"],
+    }
+}
+
+/// Model-family fallback only; provider-advertised capabilities take precedence.
+pub(crate) fn gemini_reasoning_efforts(id: &str) -> Vec<&'static str> {
+    if id.starts_with("gemini-3.8-flash")
+        || id.starts_with("gemini-3.7-flash")
+        || id.starts_with("gemini-3.1-pro")
+    {
+        vec!["low", "medium", "high"]
+    } else if id.starts_with("gemini-3-pro") {
+        vec!["low", "high"]
+    } else if id.starts_with("gemini-3") {
+        vec!["minimal", "low", "medium", "high"]
+    } else if id.starts_with("gemini-2.5-pro") {
+        vec!["low", "medium", "high"]
+    } else if id.starts_with("gemini-2.5") {
+        vec!["none", "low", "medium", "high"]
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,95 +551,5 @@ mod tests {
             );
         }
         assert!(model_entry(&config, &json!({"name":"models/gemini-embedding-2","supportedGenerationMethods":["embedContent"]})).is_none());
-    }
-}
-
-fn gpt5_minor(id: &str) -> Option<u32> {
-    let rest = id.strip_prefix("gpt-5")?;
-    let digits: String = rest
-        .strip_prefix(['.', '-'])?
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    // A four-digit hyphenated suffix starts a snapshot date, not a minor version.
-    if rest.starts_with('-') && digits.len() == 4 {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-/// Reasoning tiers the public Responses API accepts per OpenAI model family,
-/// lightest first. GPT-5.1 replaced `minimal` with `none`, 5.2 added `xhigh`,
-/// 5.6 added `max`, GPT-6 Astra and GPT-6.1 Sol dropped `none`; GPT-6 Sol/Luna retain it. Codex, Pro and chat variants keep
-/// their own narrower sets. A request outside the set is a 400.
-fn openai_reasoning_efforts(id: &str) -> Vec<&'static str> {
-    let lower = id.to_ascii_lowercase();
-    // A fine-tune is `ft:<family>:<org>:<suffix>`; only the family matters.
-    let family = lower.strip_prefix("ft:").unwrap_or(&lower);
-    let family = family.split(':').next().unwrap_or(family);
-    let segment = |name: &str| family.split(['-', '.']).any(|part| part == name);
-    if family.contains("deep-research") {
-        return vec!["medium"];
-    }
-    if family.starts_with("gpt-6") {
-        if family.starts_with("gpt-6-sol") || family.starts_with("gpt-6-luna") {
-            return vec!["none", "low", "medium", "high", "xhigh", "max"];
-        }
-        return vec!["low", "medium", "high", "xhigh", "max"];
-    }
-    if !family.starts_with("gpt-5") {
-        return if ["o1", "o3", "o4"]
-            .iter()
-            .any(|prefix| family.starts_with(prefix))
-        {
-            vec!["low", "medium", "high"]
-        } else {
-            Vec::new()
-        };
-    }
-    let minor = gpt5_minor(family);
-    if segment("chat") {
-        return Vec::new();
-    }
-    if segment("pro") {
-        return if minor.is_some() {
-            vec!["medium", "high", "xhigh"]
-        } else {
-            vec!["high"]
-        };
-    }
-    if segment("codex") {
-        return match minor {
-            Some(version) if version >= 3 => vec!["none", "low", "medium", "high", "xhigh"],
-            Some(version) if version >= 2 => vec!["low", "medium", "high", "xhigh"],
-            _ if family.contains("codex-max") => vec!["low", "medium", "high", "xhigh"],
-            _ => vec!["low", "medium", "high"],
-        };
-    }
-    match minor {
-        None => vec!["minimal", "low", "medium", "high"],
-        Some(1) => vec!["none", "low", "medium", "high"],
-        Some(version) if version >= 6 => vec!["none", "low", "medium", "high", "xhigh", "max"],
-        Some(_) => vec!["none", "low", "medium", "high", "xhigh"],
-    }
-}
-
-/// Model-family fallback only; provider-advertised capabilities take precedence.
-pub(crate) fn gemini_reasoning_efforts(id: &str) -> Vec<&'static str> {
-    if id.starts_with("gemini-3.8-flash")
-        || id.starts_with("gemini-3.7-flash")
-        || id.starts_with("gemini-3.1-pro")
-    {
-        vec!["low", "medium", "high"]
-    } else if id.starts_with("gemini-3-pro") {
-        vec!["low", "high"]
-    } else if id.starts_with("gemini-3") {
-        vec!["minimal", "low", "medium", "high"]
-    } else if id.starts_with("gemini-2.5-pro") {
-        vec!["low", "medium", "high"]
-    } else if id.starts_with("gemini-2.5") {
-        vec!["none", "low", "medium", "high"]
-    } else {
-        Vec::new()
     }
 }

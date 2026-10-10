@@ -36,11 +36,11 @@ async fn fixture(
 async fn from_adapter(config: ProviderConfig) -> Option<Vec<ModelObject>> {
     let app = router_core::AppConfig {
         providers: [("customer".into(), config.clone())].into(),
-        models: Default::default(),
-        aliases: Default::default(),
-        server: Default::default(),
-        auth: Default::default(),
-        web_ui: Default::default(),
+        models: BTreeMap::default(),
+        aliases: BTreeMap::default(),
+        server: router_core::ServerConfig::default(),
+        auth: router_core::AuthConfig::default(),
+        web_ui: router_core::WebUiConfig::default(),
     };
     crate::build_adapters(&app).unwrap()["customer"]
         .discover_models(&config, Some(&SecretString::from("customer-key")))

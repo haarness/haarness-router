@@ -1,4 +1,4 @@
-//! AWS ConverseStream with Bedrock bearer API keys. Never consult process AWS credentials.
+//! AWS `ConverseStream` with Bedrock bearer API keys. Never consult process AWS credentials.
 use crate::{
     sse::{request_error, upstream_request_id},
     transport::ProviderTransport,
@@ -68,7 +68,7 @@ impl ProviderAdapter for BedrockAdapter {
         let mut url = url::Url::parse(&format!("{}/", self.base_url.trim_end_matches('/')))
             .map_err(|_| RouterError::invalid("Invalid Bedrock endpoint", "provider"))?;
         url.path_segments_mut()
-            .map_err(|_| RouterError::invalid("Invalid endpoint", "provider"))?
+            .map_err(|()| RouterError::invalid("Invalid endpoint", "provider"))?
             .pop_if_empty()
             .push("model")
             .push(model)
@@ -102,10 +102,10 @@ impl ProviderAdapter for BedrockAdapter {
                 for bytes in chunk.chunks(16 * 1024) {
                     buffer.extend_from_slice(bytes);
                     while let Some((kind, event)) = take_frame(&mut buffer)? {
-                        let index = event["contentBlockIndex"].as_u64().unwrap_or(0) as u32;
+                        let index = event["contentBlockIndex"].as_u64().and_then(|i| u32::try_from(i).ok()).unwrap_or(0);
                         match kind.as_str() {
                             "contentBlockStart" => if let Some(tool) = event.pointer("/start/toolUse") {
-                                let tool_index = tools.len() as u32;
+                                let tool_index = u32::try_from(tools.len()).map_err(|_| invalid_stream("Too many Bedrock tool calls"))?;
                                 tools.insert(index, tool_index);
                                 yield ProviderEvent::ToolCallDelta { choice_index: 0, tool_index, id: tool["toolUseId"].as_str().map(str::to_owned), kind: "function".into(), name: tool["name"].as_str().map(str::to_owned), arguments: None };
                             },
@@ -185,7 +185,7 @@ fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<(String, Value)>, RouterErr
         if headers.len() < name_len + 4 {
             return Err(invalid_stream("Invalid Bedrock event headers"));
         }
-        let name = &headers[1..1 + name_len];
+        let name = &headers[1..=name_len];
         if headers[1 + name_len] != 7 {
             return Err(invalid_stream("Unsupported Bedrock event header type"));
         }
@@ -366,16 +366,20 @@ mod tests {
             (":event-type", kind),
             (":content-type", "application/json"),
         ] {
-            headers.push(name.len() as u8);
+            headers.push(u8::try_from(name.len()).unwrap());
             headers.extend(name.as_bytes());
             headers.push(7);
-            headers.extend((value.len() as u16).to_be_bytes());
+            headers.extend(u16::try_from(value.len()).unwrap().to_be_bytes());
             headers.extend(value.as_bytes());
         }
         let payload = value.to_string();
         let mut result = Vec::new();
-        result.extend(((16 + headers.len() + payload.len()) as u32).to_be_bytes());
-        result.extend((headers.len() as u32).to_be_bytes());
+        result.extend(
+            u32::try_from(16 + headers.len() + payload.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
+        result.extend(u32::try_from(headers.len()).unwrap().to_be_bytes());
         result.extend(crc32fast::hash(&result).to_be_bytes());
         result.extend(headers);
         result.extend(payload.as_bytes());
