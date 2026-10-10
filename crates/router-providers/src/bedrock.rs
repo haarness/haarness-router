@@ -1,10 +1,14 @@
 //! AWS ConverseStream with Bedrock bearer API keys. Never consult process AWS credentials.
-use crate::{sse::request_error, transport::ProviderTransport};
+use crate::{
+    sse::{request_error, upstream_request_id},
+    transport::ProviderTransport,
+};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use router_core::{
-    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, RouterError,
+    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, ProviderStream,
+    RouterError, UpstreamFailure,
 };
 use router_protocol::{ChatCompletionRequest, MessageContent, Usage};
 use secrecy::{ExposeSecret, SecretString};
@@ -39,11 +43,25 @@ impl ProviderAdapter for BedrockAdapter {
     async fn stream(
         &self,
         model: &str,
-        mut request: ChatCompletionRequest,
+        request: ChatCompletionRequest,
         capabilities: Capabilities,
         api_key: Option<&SecretString>,
         cancel: CancellationToken,
     ) -> Result<EventStream, RouterError> {
+        Ok(self
+            .open_stream(model, request, capabilities, api_key, cancel)
+            .await?
+            .events)
+    }
+
+    async fn open_stream(
+        &self,
+        model: &str,
+        mut request: ChatCompletionRequest,
+        capabilities: Capabilities,
+        api_key: Option<&SecretString>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream, RouterError> {
         let key = api_key.ok_or_else(|| RouterError::unavailable("Bedrock API key is missing"))?;
         crate::attachment::prepare_pdf_fallback(&mut request, capabilities).await?;
         let body = converse_request(&request)?;
@@ -60,8 +78,9 @@ impl ProviderAdapter for BedrockAdapter {
             result = self.transport.client().post(url).bearer_auth(key.expose_secret()).json(&body).send() => result.map_err(request_error)?,
         };
         let response = self.transport.checked(response).await?;
+        let upstream_request_id = upstream_request_id(response.headers());
         let idle = self.idle;
-        Ok(Box::pin(try_stream! {
+        let events = Box::pin(try_stream! {
             let mut chunks = response.bytes_stream();
             let mut buffer = Vec::new();
             let mut stopped = false;
@@ -76,7 +95,8 @@ impl ProviderAdapter for BedrockAdapter {
                     Ok(Some(Ok(chunk))) => chunk,
                     Ok(Some(Err(e))) => Err(request_error(e))?,
                     Ok(None) => break,
-                    Err(_) => Err(RouterError::timeout("Bedrock stream became idle"))?,
+                    Err(_) => Err(RouterError::timeout("Bedrock stream became idle")
+                        .with_upstream_failure(UpstreamFailure::Timeout))?,
                 };
                 // Frames are bounded, even when transport chunks split a prelude or payload.
                 for bytes in chunk.chunks(16 * 1024) {
@@ -125,7 +145,11 @@ impl ProviderAdapter for BedrockAdapter {
                 }
             }
             if !buffer.is_empty() || !stopped || !usage_seen { Err(invalid_stream("Bedrock stream ended before completion and usage"))?; }
-        }))
+        });
+        Ok(ProviderStream {
+            events,
+            upstream_request_id,
+        })
     }
 }
 

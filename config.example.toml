@@ -9,6 +9,9 @@ drain_seconds = 30
 # Use --require-key to require HAARNESS_ROUTER_KEY instead.
 enabled = false
 allow_upstream_key_header = false
+# With authentication on, Prometheus can read /metrics with this token
+# instead of a router key. The token cannot call models.
+# metrics_token_env = "HAARNESS_METRICS_TOKEN"
 
 # The Web UI is served by the same process at http://127.0.0.1:8080/ui.
 # Set enabled = false for an API-only deployment. For HTTP Basic protection,

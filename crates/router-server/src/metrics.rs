@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use router_core::{AppConfig, CircuitState};
+use router_core::{AppConfig, CircuitState, RouteLabels, UpstreamFailure};
 
 pub struct Metrics {
     requests: AtomicU64,
@@ -38,6 +38,33 @@ pub enum CompletionStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl CompletionStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Failed upstream calls, fallback attempts included, by configured route and
+/// a bounded failure class.
+pub fn render_upstream_failures(samples: &[(RouteLabels, UpstreamFailure, u64)]) -> String {
+    let mut output = String::from("# TYPE haarness_router_upstream_failures_total counter\n");
+    for (labels, failure, count) in samples {
+        let _ = writeln!(
+            output,
+            "haarness_router_upstream_failures_total{{provider=\"{}\",model=\"{}\",alias=\"{}\",class=\"{}\"}} {count}",
+            prometheus_escape(&labels.provider),
+            prometheus_escape(&labels.model),
+            prometheus_escape(&labels.alias),
+            failure.label()
+        );
+    }
+    output
 }
 
 pub fn render_circuit_states(states: &[(String, CircuitState)]) -> String {

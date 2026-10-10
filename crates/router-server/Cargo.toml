@@ -30,6 +30,7 @@ uuid.workspace = true
 reqwest.workspace = true
 router-providers = { version = "0.1.0", path = "../router-providers" }
 tower.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

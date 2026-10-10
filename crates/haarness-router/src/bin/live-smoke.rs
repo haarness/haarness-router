@@ -227,6 +227,7 @@ fn live_config(models: &[(&str, &str)]) -> AppConfig {
             enabled: None,
             router_key_envs: vec!["programmatic-live-smoke".into()],
             allow_upstream_key_header: false,
+            metrics_token_env: None,
         },
         web_ui: WebUiConfig {
             enabled: false,

@@ -18,7 +18,9 @@ use axum::{
     routing::{get, post},
 };
 use futures::StreamExt;
-use router_core::{AuthStore, ProviderEvent, RoutedStream, Router, RouterError};
+use router_core::{
+    AuthStore, ProviderEvent, RouteLabels, RoutedStream, Router, RouterError, is_safe_request_id,
+};
 use router_protocol::{
     AssistantMessage, ChatCompletionRequest, ChatCompletionResponse, Choice, FunctionCall,
     ModelList, ToolCall,
@@ -31,10 +33,10 @@ use tower_http::{
     catch_panic::CatchPanicLayer,
     trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer},
 };
-use tracing::{Level, debug};
+use tracing::{Level, debug, info};
 use uuid::Uuid;
 
-use metrics::{CompletionStatus, Metrics, render_circuit_states};
+use metrics::{CompletionStatus, Metrics, render_circuit_states, render_upstream_failures};
 use ui::UiState;
 
 #[derive(Clone)]
@@ -100,30 +102,28 @@ pub fn app(state: AppState) -> AxumRouter {
 
 async fn chat_completions(State(state): State<AppState>, request: Request<Body>) -> Response {
     state.metrics.request();
-    let started = Instant::now();
-    let request_id = format!("req_{}", Uuid::now_v7());
-    let result = handle_chat(&state, request, &request_id, started).await;
-    match result {
+    let mut log = RequestLog::new(request.headers());
+    match handle_chat(&state, request, &mut log).await {
         Ok(response) => response,
         Err(error) => {
             state.metrics.error();
-            debug!(
-                request_id,
-                status = error.status.as_u16(),
-                error_type = %error.body.kind,
-                error_code = %error.body.code,
-                "request rejected"
-            );
-            api_error(error, &request_id)
+            let outcome = if log.attempts == 0 {
+                "rejected"
+            } else {
+                "failed"
+            };
+            log.emit(Some(error.status), outcome, Some(&error.body.code));
+            api_error(error, &log.request_id)
         }
     }
 }
 
+/// Routes one chat request. Once a route is chosen the request guard owns
+/// the summary log line; an `Err` means the caller still has to write it.
 async fn handle_chat(
     state: &AppState,
     request: Request<Body>,
-    request_id: &str,
-    started: Instant,
+    log: &mut RequestLog,
 ) -> Result<Response, RouterError> {
     authenticate(state, request.headers())?;
     let permit = state.concurrency.clone().try_acquire_owned().map_err(|_| {
@@ -150,34 +150,61 @@ async fn handle_chat(
     let wants_stream = chat_request.stream;
     let include_usage = chat_request.wants_usage_stream();
     let cancel = CancellationToken::new();
-    let routed = state
+    let routed = match state
         .router
-        .route(chat_request, upstream_override, cancel.clone())
-        .await?;
-    let first_event_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        .route_with_context(chat_request, upstream_override, cancel.clone())
+        .await
+    {
+        Ok(routed) => routed,
+        Err(failure) => {
+            log.labels = failure.labels;
+            log.attempts = failure.attempts;
+            log.upstream_request_id = failure
+                .error
+                .upstream_request_id
+                .as_deref()
+                .map(str::to_owned);
+            return Err(failure.error);
+        }
+    };
+    let labels = routed.labels();
+    log.labels = Some(labels.clone());
+    log.attempts = routed.attempts;
+    log.upstream_request_id
+        .clone_from(&routed.upstream_request_id);
+    let first_event_micros = u64::try_from(log.started.elapsed().as_micros()).unwrap_or(u64::MAX);
     state.metrics.fallback_attempts(routed.attempts);
     state.metrics.first_event(first_event_micros);
     state.metrics.start_stream(
-        &routed.provider,
-        &routed.metric_model,
+        &labels.provider,
+        &labels.model,
         routed.attempts,
         first_event_micros,
     );
+    // Configured labels only: the raw model string stays out of logs.
     debug!(
-        request_id,
-        provider = %routed.provider,
-        model = %routed.model,
+        request_id = %log.request_id,
+        alias = %labels.alias,
+        provider = %labels.provider,
+        model = %labels.model,
         attempts = routed.attempts,
         stream = wants_stream,
         "request routed"
     );
     if wants_stream {
-        Ok(streaming_response(
-            routed,
-            request_id,
-            include_usage,
+        // The 200 and its headers go out before the first frame.
+        let guard = RequestGuard::new(
             cancel,
             permit,
+            Arc::clone(&state.metrics),
+            labels,
+            log.clone(),
+            Some(StatusCode::OK),
+        );
+        Ok(streaming_response(
+            routed,
+            include_usage,
+            guard,
             Arc::clone(&state.metrics),
         ))
     } else {
@@ -185,24 +212,29 @@ async fn handle_chat(
             cancel,
             permit,
             Arc::clone(&state.metrics),
-            request_id,
-            &routed.provider,
-            &routed.metric_model,
-            routed.attempts,
+            labels,
+            log.clone(),
+            None,
         );
-        let response = nonstream_response(routed, request_id).await;
-        guard.finish(if response.is_ok() {
-            CompletionStatus::Completed
-        } else {
-            CompletionStatus::Failed
-        });
-        response
+        match nonstream_response(routed, &log.request_id).await {
+            Ok(response) => {
+                guard.http_status = Some(StatusCode::OK);
+                guard.finish(CompletionStatus::Completed, None);
+                Ok(response)
+            }
+            Err(error) => {
+                state.metrics.error();
+                guard.http_status = Some(error.status);
+                guard.finish(CompletionStatus::Failed, Some(&error.body.code));
+                Ok(api_error(error, &log.request_id))
+            }
+        }
     }
 }
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(error) = authenticate(&state, &headers) {
-        return api_error(error, &format!("req_{}", Uuid::now_v7()));
+        return api_error(error, &request_id(&headers));
     }
     state.router.refresh_models().await;
     axum::Json(ModelList {
@@ -216,30 +248,52 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, axum::Json(json!({"status": "ok"})))
 }
 
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(error) = authenticate_metrics(&state, &headers) {
+        return api_error(error, &request_id(&headers));
+    }
     let mut output = state.metrics.render();
+    output.push_str(&render_upstream_failures(&state.router.upstream_failures()));
     output.push_str(&render_circuit_states(&state.router.circuit_states()));
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         output,
     )
+        .into_response()
 }
 
 fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), RouterError> {
     if !state.auth.authentication_required() {
         return Ok(());
     }
+    if !state.auth.authenticate(bearer_token(headers)?) {
+        return Err(RouterError::unauthorized("invalid router API key"));
+    }
+    Ok(())
+}
+
+/// `/metrics` is open exactly when the model API is. With authentication on
+/// it takes a router key or the scrape token, which cannot call models.
+fn authenticate_metrics(state: &AppState, headers: &HeaderMap) -> Result<(), RouterError> {
+    if !state.auth.authentication_required() {
+        return Ok(());
+    }
+    if !state.auth.authenticate_metrics(bearer_token(headers)?) {
+        return Err(RouterError::unauthorized(
+            "invalid router API key or metrics token",
+        ));
+    }
+    Ok(())
+}
+
+fn bearer_token(headers: &HeaderMap) -> Result<&str, RouterError> {
     let header = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| RouterError::unauthorized("missing Authorization bearer token"))?;
-    let candidate = header
+    header
         .strip_prefix("Bearer ")
-        .ok_or_else(|| RouterError::unauthorized("Authorization must use Bearer authentication"))?;
-    if !state.auth.authenticate(candidate) {
-        return Err(RouterError::unauthorized("invalid router API key"));
-    }
-    Ok(())
+        .ok_or_else(|| RouterError::unauthorized("Authorization must use Bearer authentication"))
 }
 
 fn upstream_override(
@@ -270,37 +324,23 @@ fn upstream_override(
 
 fn streaming_response(
     mut routed: RoutedStream,
-    request_id: &str,
     include_usage: bool,
-    cancel: CancellationToken,
-    permit: OwnedSemaphorePermit,
+    mut guard: RequestGuard,
     metrics: Arc<Metrics>,
 ) -> Response {
     let response_id = format!("chatcmpl-{}", Uuid::now_v7());
     let model = format!("{}/{}", routed.provider, routed.model);
     let created = unix_timestamp();
-    let request_id_owned = request_id.to_owned();
-    let metrics_for_stream = Arc::clone(&metrics);
+    let request_id = guard.log.request_id.clone();
     let provider = routed.provider.clone();
     let served_model = routed.model.clone();
-    let metric_model = routed.metric_model.clone();
     let attempts = routed.attempts;
     let exclude_reasoning = routed.exclude_reasoning;
-    let guard_request_id = request_id_owned.clone();
-    let guard_provider = provider.clone();
-    let guard_metric_model = metric_model.clone();
+    let metric_provider = guard.labels.provider.clone();
+    let metric_model = guard.labels.model.clone();
     let output = stream! {
-        let mut guard = RequestGuard::new(
-            cancel,
-            permit,
-            metrics_for_stream,
-            &guard_request_id,
-            &guard_provider,
-            &guard_metric_model,
-            attempts,
-        );
         let mut announced = BTreeSet::new();
-        let mut failed = false;
+        let mut failure = None;
         while let Some(item) = routed.stream.next().await {
             let payload = match item {
                 Ok(ProviderEvent::Usage(usage)) if !include_usage => {
@@ -313,26 +353,27 @@ fn streaming_response(
                 Ok(event) => chunk_for_event(&response_id, &model, created, event, &mut announced),
                 Err(error) => {
                     metrics.error();
-                    failed = true;
+                    failure = Some(error.body.code.clone());
                     serde_json::to_value(error.envelope()).unwrap_or_else(|_| json!({
                         "error": {"message":"stream failed","type":"upstream_error","code":"stream_error"}
                     }))
                 },
             };
             let frame = format!("data: {payload}\n\n");
-            metrics.bytes(&guard_provider, &guard_metric_model, frame.len());
+            metrics.bytes(&metric_provider, &metric_model, frame.len());
             yield Ok::<Bytes, Infallible>(Bytes::from(frame));
             if payload.get("error").is_some() {
                 break;
             }
         }
         let done = Bytes::from_static(b"data: [DONE]\n\n");
-        metrics.bytes(&guard_provider, &guard_metric_model, done.len());
-        guard.finish(if failed {
+        metrics.bytes(&metric_provider, &metric_model, done.len());
+        let status = if failure.is_some() {
             CompletionStatus::Failed
         } else {
             CompletionStatus::Completed
-        });
+        };
+        guard.finish(status, failure.as_deref());
         yield Ok::<Bytes, Infallible>(done);
     };
     let mut response = Response::new(Body::from_stream(output));
@@ -351,7 +392,7 @@ fn streaming_response(
         &provider,
         &served_model,
         attempts,
-        &request_id_owned,
+        &request_id,
     );
     response
 }
@@ -643,15 +684,109 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+/// One request's INFO summary line. Every field is a router ID, a validated
+/// caller or provider ID, or a configuration label: never a prompt, header
+/// value, credential, or the model string the client sent.
+#[derive(Clone)]
+struct RequestLog {
+    request_id: String,
+    trace_id: Option<String>,
+    started: Instant,
+    labels: Option<RouteLabels>,
+    attempts: usize,
+    upstream_request_id: Option<String>,
+}
+
+impl RequestLog {
+    fn new(headers: &HeaderMap) -> Self {
+        Self {
+            request_id: request_id(headers),
+            trace_id: trace_id(headers),
+            started: Instant::now(),
+            labels: None,
+            attempts: 0,
+            upstream_request_id: None,
+        }
+    }
+
+    fn emit(&self, status: Option<StatusCode>, outcome: &str, error_code: Option<&str>) {
+        let labels = self.labels.as_ref();
+        info!(
+            request_id = %self.request_id,
+            trace_id = self.trace_id.as_deref(),
+            alias = labels.map(|labels| labels.alias.as_str()),
+            provider = labels.map(|labels| labels.provider.as_str()),
+            model = labels.map(|labels| labels.model.as_str()),
+            status = status.map(|status| status.as_u16()),
+            outcome,
+            error_code,
+            fallbacks = self.attempts.saturating_sub(1),
+            upstream_request_id = self.upstream_request_id.as_deref(),
+            duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "request finished"
+        );
+    }
+}
+
+/// The caller's `X-Request-ID` when it is safe to log and echo, otherwise a
+/// fresh router ID.
+fn request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| is_safe_request_id(value))
+        .map_or_else(|| format!("req_{}", Uuid::now_v7()), str::to_owned)
+}
+
+/// The trace ID of the caller's W3C `traceparent`, so logs join its trace.
+/// Malformed or repeated headers are ignored; none is forwarded upstream.
+fn trace_id(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all("traceparent").iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    parse_traceparent(value).map(str::to_owned)
+}
+
+/// `version-traceid-parentid-flags` in lowercase hex. Version `ff` and
+/// all-zero IDs are invalid; version `00` has exactly these four fields,
+/// while a later version may append more after another dash.
+fn parse_traceparent(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 55 || bytes[2] != b'-' || bytes[35] != b'-' || bytes[52] != b'-' {
+        return None;
+    }
+    let (version, trace, parent, flags) =
+        (&bytes[..2], &bytes[3..35], &bytes[36..52], &bytes[53..55]);
+    let lower_hex = |field: &[u8]| {
+        field
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let nonzero = |field: &[u8]| field.iter().any(|byte| *byte != b'0');
+    let length_valid = if version == b"00" {
+        bytes.len() == 55
+    } else {
+        bytes.len() == 55 || bytes[55] == b'-'
+    };
+    (length_valid
+        && version != b"ff"
+        && [version, trace, parent, flags].into_iter().all(lower_hex)
+        && nonzero(trace)
+        && nonzero(parent))
+    .then(|| &value[3..35])
+}
+
 struct RequestGuard {
     cancel: CancellationToken,
     _permit: OwnedSemaphorePermit,
     metrics: Arc<Metrics>,
     started: Instant,
-    request_id: String,
-    provider: String,
-    model: String,
-    attempts: usize,
+    labels: RouteLabels,
+    log: RequestLog,
+    /// The status the client received, once it is known.
+    http_status: Option<StatusCode>,
     finished: bool,
 }
 
@@ -660,41 +795,31 @@ impl RequestGuard {
         cancel: CancellationToken,
         permit: OwnedSemaphorePermit,
         metrics: Arc<Metrics>,
-        request_id: &str,
-        provider: &str,
-        model: &str,
-        attempts: usize,
+        labels: RouteLabels,
+        log: RequestLog,
+        http_status: Option<StatusCode>,
     ) -> Self {
         Self {
             cancel,
             _permit: permit,
             metrics,
             started: Instant::now(),
-            request_id: request_id.to_owned(),
-            provider: provider.to_owned(),
-            model: model.to_owned(),
-            attempts,
+            labels,
+            log,
+            http_status,
             finished: false,
         }
     }
 
-    fn finish(&mut self, status: CompletionStatus) {
+    fn finish(&mut self, status: CompletionStatus, error_code: Option<&str>) {
         if self.finished {
             return;
         }
         self.finished = true;
         let elapsed = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.metrics
-            .finish_stream(&self.provider, &self.model, status, elapsed);
-        debug!(
-            request_id = %self.request_id,
-            provider = %self.provider,
-            model = %self.model,
-            attempts = self.attempts,
-            status = ?status,
-            completion_microseconds = elapsed,
-            "request finished"
-        );
+            .finish_stream(&self.labels.provider, &self.labels.model, status, elapsed);
+        self.log.emit(self.http_status, status.label(), error_code);
     }
 }
 
@@ -702,7 +827,65 @@ impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.cancel.cancel();
         if !self.finished {
-            self.finish(CompletionStatus::Cancelled);
+            self.finish(CompletionStatus::Cancelled, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::{parse_traceparent, request_id, trace_id};
+
+    const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    #[test]
+    fn accepts_safe_caller_request_ids_and_replaces_others() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("client-42:retry.1"),
+        );
+        assert_eq!(request_id(&headers), "client-42:retry.1");
+        for unsafe_id in ["has space", "semi;colon", &"x".repeat(129)] {
+            headers.insert("x-request-id", HeaderValue::from_str(unsafe_id).unwrap());
+            let replaced = request_id(&headers);
+            assert!(replaced.starts_with("req_"), "{unsafe_id}: {replaced}");
+        }
+        assert!(request_id(&HeaderMap::new()).starts_with("req_"));
+    }
+
+    #[test]
+    fn parses_only_strict_w3c_traceparent_values() {
+        let valid = format!("00-{TRACE}-00f067aa0ba902b7-01");
+        assert_eq!(parse_traceparent(&valid), Some(TRACE));
+        // A later version may carry more fields after another dash.
+        let future = format!("01-{TRACE}-00f067aa0ba902b7-09-extra");
+        assert_eq!(parse_traceparent(&future), Some(TRACE));
+        for invalid in [
+            format!("00-{TRACE}-00f067aa0ba902b7-01-extra"),
+            format!("ff-{TRACE}-00f067aa0ba902b7-01"),
+            format!("00-{}-00f067aa0ba902b7-01", TRACE.to_uppercase()),
+            format!("00-{}-00f067aa0ba902b7-01", "0".repeat(32)),
+            format!("00-{TRACE}-0000000000000000-01"),
+            format!("00-{TRACE}-00f067aa0ba902b7-1"),
+            format!("01-{TRACE}-00f067aa0ba902b7-01x"),
+            format!("00_{TRACE}_00f067aa0ba902b7_01"),
+            format!("00-{TRACE}-00f067aa0ba902b-701"),
+            String::new(),
+        ] {
+            assert_eq!(parse_traceparent(&invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn ignores_repeated_traceparent_headers() {
+        let value = HeaderValue::from_str(&format!("00-{TRACE}-00f067aa0ba902b7-01")).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", value.clone());
+        assert_eq!(trace_id(&headers).as_deref(), Some(TRACE));
+        headers.append("traceparent", value);
+        assert_eq!(trace_id(&headers), None);
     }
 }

@@ -4,14 +4,19 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use router_core::{
-    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, RouterError,
+    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, ProviderStream,
+    RouterError,
 };
 use router_protocol::{ChatCompletionRequest, Message, MessageContent, Tool, Usage};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::{attachment::prepare_pdf_fallback, sse::request_error, transport::ProviderTransport};
+use crate::{
+    attachment::prepare_pdf_fallback,
+    sse::{request_error, upstream_request_id},
+    transport::ProviderTransport,
+};
 
 pub struct AnthropicAdapter {
     transport: ProviderTransport,
@@ -43,11 +48,25 @@ impl ProviderAdapter for AnthropicAdapter {
     async fn stream(
         &self,
         model: &str,
-        mut request: ChatCompletionRequest,
+        request: ChatCompletionRequest,
         capabilities: Capabilities,
         api_key: Option<&SecretString>,
         cancel: CancellationToken,
     ) -> Result<EventStream, RouterError> {
+        Ok(self
+            .open_stream(model, request, capabilities, api_key, cancel)
+            .await?
+            .events)
+    }
+
+    async fn open_stream(
+        &self,
+        model: &str,
+        mut request: ChatCompletionRequest,
+        capabilities: Capabilities,
+        api_key: Option<&SecretString>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream, RouterError> {
         validate_nested_extensions(&request)?;
         prepare_pdf_fallback(&mut request, capabilities).await?;
         let key = api_key.ok_or_else(|| RouterError::unavailable("provider API key is missing"))?;
@@ -63,8 +82,9 @@ impl ProviderAdapter for AnthropicAdapter {
         }
         let response = builder.json(&body).send().await.map_err(request_error)?;
         let response = self.transport.checked(response).await?;
+        let upstream_request_id = upstream_request_id(response.headers());
         let mut source = self.transport.sse(response, cancel);
-        Ok(Box::pin(try_stream! {
+        let events = Box::pin(try_stream! {
             let mut thinking = std::collections::HashMap::<u32, String>::new();
             let mut prompt = PromptUsage::default();
             let mut output_tokens = 0;
@@ -162,7 +182,11 @@ impl ProviderAdapter for AnthropicAdapter {
                     _ => {}
                 }
             }
-        }))
+        });
+        Ok(ProviderStream {
+            events,
+            upstream_request_id,
+        })
     }
 }
 

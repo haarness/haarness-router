@@ -2,14 +2,19 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use router_core::{
-    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, RouterError,
+    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, ProviderStream,
+    RouterError,
 };
 use router_protocol::{ChatCompletionRequest, Usage};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::{attachment::prepare_pdf_fallback, sse::request_error, transport::ProviderTransport};
+use crate::{
+    attachment::prepare_pdf_fallback,
+    sse::{request_error, upstream_request_id},
+    transport::ProviderTransport,
+};
 
 pub struct OpenAiCompatibleAdapter {
     transport: ProviderTransport,
@@ -61,11 +66,25 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
     async fn stream(
         &self,
         model: &str,
-        mut request: ChatCompletionRequest,
+        request: ChatCompletionRequest,
         capabilities: Capabilities,
         api_key: Option<&SecretString>,
         cancel: CancellationToken,
     ) -> Result<EventStream, RouterError> {
+        Ok(self
+            .open_stream(model, request, capabilities, api_key, cancel)
+            .await?
+            .events)
+    }
+
+    async fn open_stream(
+        &self,
+        model: &str,
+        mut request: ChatCompletionRequest,
+        capabilities: Capabilities,
+        api_key: Option<&SecretString>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream, RouterError> {
         let key = api_key.ok_or_else(|| RouterError::unavailable("provider API key is missing"))?;
         let auth_value = self.auth_scheme.as_ref().map_or_else(
             || key.expose_secret().to_owned(),
@@ -108,8 +127,9 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             .await
             .map_err(request_error)?;
         let response = self.transport.checked(response).await?;
+        let upstream_request_id = upstream_request_id(response.headers());
         let mut source = self.transport.sse(response, cancel);
-        Ok(Box::pin(try_stream! {
+        let events = Box::pin(try_stream! {
             while let Some(value) = source.next().await {
                 let value = value?;
                 if let Some(error) = value.get("error") {
@@ -178,7 +198,11 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                     }
                 }
             }
-        }))
+        });
+        Ok(ProviderStream {
+            events,
+            upstream_request_id,
+        })
     }
 }
 

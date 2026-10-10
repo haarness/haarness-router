@@ -66,6 +66,9 @@ impl AppConfig {
             for environment in &self.auth.router_key_envs {
                 require_environment(environment, "auth.router_key_envs")?;
             }
+            if let Some(environment) = &self.auth.metrics_token_env {
+                require_environment(environment, "auth.metrics_token_env")?;
+            }
         }
         self.web_ui.validate()?;
         for (name, provider) in &self.providers {
@@ -251,6 +254,10 @@ pub struct AuthConfig {
     pub router_key_envs: Vec<String>,
     #[serde(default)]
     pub allow_upstream_key_header: bool,
+    /// Environment variable holding a bearer token that may read `/metrics`
+    /// but cannot call models. Ignored while authentication is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_token_env: Option<String>,
 }
 
 impl AuthConfig {
@@ -686,6 +693,27 @@ mod tests {
             assert!(config.validate().is_err());
             assert!(crate::AuthStore::from_config(&config).is_err());
         }
+    }
+
+    #[test]
+    fn metrics_token_reference_is_checked_only_when_auth_is_on() {
+        use super::AppConfig;
+        let config = |enabled: bool| -> AppConfig {
+            // PATH stands in for a present router key; only presence is checked.
+            serde_json::from_value(serde_json::json!({
+                "auth": {
+                    "enabled": enabled,
+                    "router_key_envs": ["PATH"],
+                    "metrics_token_env": "HAARNESS_MISSING_METRICS_TOKEN"
+                },
+                "providers": {}
+            }))
+            .unwrap()
+        };
+        config(false).validate().unwrap();
+        let error = config(true).validate().unwrap_err();
+        assert_eq!(error.body.param.as_deref(), Some("auth.metrics_token_env"));
+        assert!(crate::AuthStore::from_config(&config(true)).is_err());
     }
 
     #[test]

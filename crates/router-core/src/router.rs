@@ -21,7 +21,9 @@ use router_protocol::{ChatCompletionRequest, ModelObject, Usage};
 
 use crate::{
     AppConfig, CircuitBreaker, CircuitState, ProviderConfig, ProviderKind, Requirements,
-    RouterError, config::split_target,
+    RouterError,
+    config::split_target,
+    observability::{DIRECT_ROUTE, RouteLabels, UpstreamFailure, UpstreamFailureCounters},
 };
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, RouterError>> + Send>>;
@@ -81,6 +83,31 @@ pub trait ProviderAdapter: Send + Sync {
         api_key: Option<&SecretString>,
         cancel: CancellationToken,
     ) -> Result<EventStream, RouterError>;
+
+    /// `stream` plus what the provider's response headers said about the call.
+    /// The router calls this; adapters that read response headers override it
+    /// and implement `stream` on top of it.
+    async fn open_stream(
+        &self,
+        model: &str,
+        request: ChatCompletionRequest,
+        capabilities: crate::Capabilities,
+        api_key: Option<&SecretString>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream, RouterError> {
+        Ok(ProviderStream {
+            events: self
+                .stream(model, request, capabilities, api_key, cancel)
+                .await?,
+            upstream_request_id: None,
+        })
+    }
+}
+
+pub struct ProviderStream {
+    pub events: EventStream,
+    /// The provider's own request ID, when its response headers carried one.
+    pub upstream_request_id: Option<String>,
 }
 
 pub struct RoutedStream {
@@ -89,9 +116,41 @@ pub struct RoutedStream {
     pub model: String,
     /// Bounded observability label: a declared model ID or `_undeclared`.
     pub metric_model: String,
+    /// Bounded observability label: the configured alias or `_direct`.
+    pub alias: String,
     pub attempts: usize,
     pub exclude_reasoning: bool,
+    /// The serving provider's own request ID, when it sent one.
+    pub upstream_request_id: Option<String>,
     pub stream: EventStream,
+}
+
+impl RoutedStream {
+    #[must_use]
+    pub fn labels(&self) -> RouteLabels {
+        RouteLabels {
+            alias: self.alias.clone(),
+            provider: self.provider.clone(),
+            model: self.metric_model.clone(),
+        }
+    }
+}
+
+/// A request that could not be routed, with what is known about where it went.
+#[derive(Debug)]
+pub struct RouteFailure {
+    pub error: RouterError,
+    /// Labels of the last target considered; `None` when the request named
+    /// no configured target.
+    pub labels: Option<RouteLabels>,
+    /// Upstream calls made before giving up.
+    pub attempts: usize,
+}
+
+#[derive(Default)]
+struct RouteProgress {
+    labels: Option<RouteLabels>,
+    attempts: usize,
 }
 
 #[derive(Clone)]
@@ -110,6 +169,7 @@ pub struct Router {
     adapters: AdapterMap,
     provider_keys: HashMap<String, Arc<SecretString>>,
     breakers: DashMap<String, Arc<CircuitBreaker>>,
+    upstream_failures: Arc<UpstreamFailureCounters>,
     model_catalog: Mutex<HashMap<String, Vec<ModelObject>>>,
     model_refresh: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
@@ -166,6 +226,7 @@ impl Router {
         Ok(Self {
             model_catalog: Mutex::new(HashMap::new()),
             model_refresh: tokio::sync::Mutex::new(None),
+            upstream_failures: Arc::new(UpstreamFailureCounters::new(&config)),
             config: Arc::new(config),
             adapters,
             provider_keys: provider_keys
@@ -260,11 +321,48 @@ impl Router {
         states
     }
 
+    /// Upstream failures by route and class, for every configured route.
+    #[must_use]
+    pub fn upstream_failures(&self) -> Vec<(RouteLabels, UpstreamFailure, u64)> {
+        self.upstream_failures.snapshot()
+    }
+
     pub async fn route(
         &self,
         request: ChatCompletionRequest,
         upstream_override: Option<SecretString>,
         cancel: CancellationToken,
+    ) -> Result<RoutedStream, RouterError> {
+        self.route_with_context(request, upstream_override, cancel)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// `route`, keeping the bounded labels and attempt count of a failure so
+    /// callers can report it without the client's raw model string.
+    pub async fn route_with_context(
+        &self,
+        request: ChatCompletionRequest,
+        upstream_override: Option<SecretString>,
+        cancel: CancellationToken,
+    ) -> Result<RoutedStream, RouteFailure> {
+        let mut progress = RouteProgress::default();
+        let result = self
+            .route_targets(request, upstream_override, cancel, &mut progress)
+            .await;
+        result.map_err(|error| RouteFailure {
+            error,
+            labels: progress.labels,
+            attempts: progress.attempts,
+        })
+    }
+
+    async fn route_targets(
+        &self,
+        request: ChatCompletionRequest,
+        upstream_override: Option<SecretString>,
+        cancel: CancellationToken,
+        progress: &mut RouteProgress,
     ) -> Result<RoutedStream, RouterError> {
         let requirements = Requirements::from_request(&request)?;
         let exclude_reasoning = request
@@ -273,23 +371,24 @@ impl Router {
             .and_then(|reasoning| reasoning.exclude)
             .unwrap_or(false);
         let requested_model = request.model.clone();
-        let targets = if let Some(alias) = self.config.aliases.get(&requested_model) {
+        let (alias, targets) = if let Some(alias) = self.config.aliases.get(&requested_model) {
             if upstream_override.is_some() {
                 return Err(RouterError::invalid(
                     "X-Upstream-API-Key requires an exact provider/model and cannot be used with aliases",
                     "model",
                 ));
             }
-            alias.targets.clone()
+            (requested_model.clone(), alias.targets.clone())
         } else {
-            vec![requested_model.clone()]
+            (DIRECT_ROUTE.to_owned(), vec![requested_model.clone()])
         };
 
-        let mut attempts = 0;
         let mut last_retryable = None;
         let mut capability_failures = Vec::new();
         for target in targets {
             let mut runtime = self.target_runtime(&target)?;
+            let labels = RouteLabels::for_target(&self.config, &alias, &target)?;
+            progress.labels = Some(labels.clone());
             if upstream_override.is_some() {
                 // Customer-key quotas and failures must not trip or heal the shared
                 // system-credential circuit. An override has one exact target;
@@ -326,7 +425,7 @@ impl Router {
                 )));
                 continue;
             };
-            attempts += 1;
+            progress.attempts += 1;
             let selected_key = upstream_override.as_ref().or(runtime.server_key.as_deref());
             if selected_key.is_none() {
                 runtime.breaker.failure(circuit_permit);
@@ -348,13 +447,23 @@ impl Router {
                         http::StatusCode::REQUEST_TIMEOUT, "request cancelled", "request_error", "request_cancelled",
                     ));
                 },
-                result = tokio::time::timeout_at(deadline, runtime.adapter.stream(
+                result = tokio::time::timeout_at(deadline, runtime.adapter.open_stream(
                     &runtime.model, request.clone(), capabilities, selected_key, cancel.child_token(),
                 )) => result.unwrap_or_else(|_| Err(RouterError::timeout(format!(
                     "provider {} did not produce response headers before the deadline", runtime.provider,
-                )))),
+                )).with_upstream_failure(UpstreamFailure::Timeout))),
             };
-            let mut stream = match result {
+            // Only failures the provider transport classified reached the
+            // provider; translation and attachment errors are not counted.
+            if let Err(error) = &result
+                && let Some(failure) = error.upstream_failure
+            {
+                self.upstream_failures.record(&labels, failure);
+            }
+            let ProviderStream {
+                events: mut stream,
+                upstream_request_id,
+            } = match result {
                 Ok(stream) => stream,
                 Err(error)
                     if error.retryable && !error.ambiguous && upstream_override.is_none() =>
@@ -381,13 +490,29 @@ impl Router {
                 },
                 first = tokio::time::timeout_at(deadline, stream.next()) => first,
             };
+            let failure = match &first {
+                Ok(Some(Ok(_))) => None,
+                Ok(Some(Err(error))) => Some(stream_failure(error)),
+                Ok(None) => Some(UpstreamFailure::Other),
+                Err(_) => Some(UpstreamFailure::Timeout),
+            };
+            if let Some(failure) = failure {
+                self.upstream_failures.record(&labels, failure);
+            }
+            // The provider's ID arrived with the headers; keep it on failures.
+            let with_request_id = |mut error: RouterError| {
+                if error.upstream_request_id.is_none() {
+                    error.upstream_request_id = upstream_request_id.as_deref().map(Box::from);
+                }
+                error
+            };
             let first = match first {
                 Ok(Some(Ok(event))) => event,
                 Ok(Some(Err(error)))
                     if error.retryable && !error.ambiguous && upstream_override.is_none() =>
                 {
                     runtime.breaker.failure(circuit_permit);
-                    last_retryable = Some(error);
+                    last_retryable = Some(with_request_id(error));
                     continue;
                 }
                 Ok(Some(Err(error))) => {
@@ -396,26 +521,28 @@ impl Router {
                     } else {
                         runtime.breaker.success(circuit_permit);
                     }
-                    return Err(error);
+                    return Err(with_request_id(error));
                 }
                 Ok(None) => {
                     runtime.breaker.failure(circuit_permit);
-                    last_retryable = Some(RouterError::upstream(
+                    last_retryable = Some(with_request_id(RouterError::upstream(
                         http::StatusCode::BAD_GATEWAY,
                         format!("provider {} returned an empty stream", runtime.provider),
-                    ));
+                    )));
                     continue;
                 }
                 Err(_) => {
                     runtime.breaker.failure(circuit_permit);
-                    return Err(RouterError::timeout(format!(
+                    return Err(with_request_id(RouterError::timeout(format!(
                         "provider {} did not produce a first event before the deadline",
                         runtime.provider
-                    )));
+                    ))));
                 }
             };
             runtime.breaker.success(circuit_permit);
             let breaker = Arc::clone(&runtime.breaker);
+            let failures = Arc::clone(&self.upstream_failures);
+            let stream_labels = labels.clone();
             let wrapped = Box::pin(try_stream! {
                 yield first;
                 while let Some(item) = stream.next().await {
@@ -423,6 +550,7 @@ impl Router {
                         Ok(event) => yield event,
                         Err(error) => {
                             breaker.stream_failure();
+                            failures.record(&stream_labels, stream_failure(&error));
                             Err(error)?;
                         }
                     }
@@ -432,13 +560,11 @@ impl Router {
                 requested_model,
                 provider: runtime.provider,
                 model: runtime.model,
-                metric_model: if self.config.models.contains_key(&target) {
-                    split_target(&target)?.1.to_owned()
-                } else {
-                    "_undeclared".into()
-                },
-                attempts,
+                metric_model: labels.model,
+                alias: labels.alias,
+                attempts: progress.attempts,
                 exclude_reasoning,
+                upstream_request_id,
                 stream: wrapped,
             });
         }
@@ -490,9 +616,17 @@ impl Router {
     }
 }
 
+/// The class of a failure after the provider accepted the request. Transport
+/// errors and idle deadlines classify themselves; anything else (a broken,
+/// malformed, or error-reporting stream) is `Other`.
+fn stream_failure(error: &RouterError) -> UpstreamFailure {
+    error.upstream_failure.unwrap_or(UpstreamFailure::Other)
+}
+
 pub struct AuthStore {
     authentication_required: bool,
     bootstrap_digests: Vec<[u8; 32]>,
+    metrics_token_digest: Option<[u8; 32]>,
     runtime_keys: DashMap<String, RuntimeRouterKey>,
     runtime_key_management: Mutex<()>,
     max_runtime_keys: usize,
@@ -538,9 +672,34 @@ impl AuthStore {
             })?;
             digests.push(digest(&key));
         }
+        let metrics_token_digest = match config
+            .auth
+            .metrics_token_env
+            .as_ref()
+            .filter(|_| authentication_required)
+        {
+            Some(name) => {
+                let token = std::env::var(name).map_err(|_| {
+                    RouterError::invalid(
+                        format!("required secret environment variable {name} is not set"),
+                        "auth.metrics_token_env",
+                    )
+                })?;
+                // An empty token would make `Authorization: Bearer ` a credential.
+                if token.is_empty() {
+                    return Err(RouterError::invalid(
+                        format!("secret environment variable {name} is empty"),
+                        "auth.metrics_token_env",
+                    ));
+                }
+                Some(digest(&token))
+            }
+            None => None,
+        };
         Ok(Self {
             authentication_required,
             bootstrap_digests: digests,
+            metrics_token_digest,
             runtime_keys: DashMap::new(),
             runtime_key_management: Mutex::new(()),
             max_runtime_keys: config.web_ui.max_runtime_keys,
@@ -556,11 +715,19 @@ impl AuthStore {
         Self {
             authentication_required: true,
             bootstrap_digests: keys.into_iter().map(digest).collect(),
+            metrics_token_digest: None,
             runtime_keys: DashMap::new(),
             runtime_key_management: Mutex::new(()),
             max_runtime_keys: 64,
             allow_upstream_key_header,
         }
+    }
+
+    /// Also accept `token` on `/metrics` only, as `auth.metrics_token_env` does.
+    #[must_use]
+    pub fn with_metrics_token(mut self, token: &str) -> Self {
+        self.metrics_token_digest = Some(digest(token));
+        self
     }
 
     #[must_use]
@@ -584,6 +751,16 @@ impl AuthStore {
             matched |= key_matches;
         }
         matched
+    }
+
+    /// `/metrics` accepts any router key or the dedicated scrape token. The
+    /// scrape token is never accepted by `authenticate`.
+    #[must_use]
+    pub fn authenticate_metrics(&self, candidate: &str) -> bool {
+        let scrape_token = self
+            .metrics_token_digest
+            .is_some_and(|expected| bool::from(expected.ct_eq(&digest(candidate))));
+        self.authenticate(candidate) | scrape_token
     }
 
     pub fn add_runtime_key(
@@ -879,6 +1056,16 @@ mod tests {
         let store = AuthStore::from_keys(["router-secret"], false);
         assert!(store.authenticate("router-secret"));
         assert!(!store.authenticate("provider-secret"));
+    }
+
+    #[test]
+    fn metrics_token_reads_metrics_but_is_not_a_router_key() {
+        let store =
+            AuthStore::from_keys(["router-secret"], false).with_metrics_token("scrape-secret");
+        assert!(store.authenticate_metrics("scrape-secret"));
+        assert!(store.authenticate_metrics("router-secret"));
+        assert!(!store.authenticate_metrics("other-secret"));
+        assert!(!store.authenticate("scrape-secret"));
     }
 
     #[test]

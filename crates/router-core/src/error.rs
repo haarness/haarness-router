@@ -3,12 +3,20 @@ use std::fmt;
 use http::StatusCode;
 use router_protocol::{ErrorBody, ErrorEnvelope};
 
+use crate::UpstreamFailure;
+
 #[derive(Debug, Clone)]
 pub struct RouterError {
     pub status: StatusCode,
     pub body: ErrorBody,
     pub retryable: bool,
     pub ambiguous: bool,
+    /// How a provider call failed, when its transport could tell. Never sent
+    /// to clients; it labels the upstream failure counter.
+    pub upstream_failure: Option<UpstreamFailure>,
+    /// The provider's own request ID for the failed call. Logged, never sent;
+    /// boxed so the `Err` of nearly every result stays small.
+    pub upstream_request_id: Option<Box<str>>,
 }
 
 impl RouterError {
@@ -29,6 +37,8 @@ impl RouterError {
             },
             retryable: false,
             ambiguous: false,
+            upstream_failure: None,
+            upstream_request_id: None,
         }
     }
 
@@ -69,6 +79,8 @@ impl RouterError {
             },
             retryable,
             ambiguous: false,
+            upstream_failure: None,
+            upstream_request_id: None,
         }
     }
 
@@ -84,6 +96,8 @@ impl RouterError {
             },
             retryable: !ambiguous,
             ambiguous,
+            upstream_failure: None,
+            upstream_request_id: None,
         }
     }
 
@@ -105,6 +119,13 @@ impl RouterError {
             "service_unavailable_error",
             "no_route_available",
         )
+    }
+
+    /// Marks this error as a failed provider call of the given class.
+    #[must_use]
+    pub fn with_upstream_failure(mut self, failure: UpstreamFailure) -> Self {
+        self.upstream_failure = Some(failure);
+        self
     }
 
     #[must_use]

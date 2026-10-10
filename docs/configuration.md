@@ -90,9 +90,35 @@ haarness-router --config config.toml --bind 127.0.0.1:9090
 
 `--bind` conflicts with `--host` and `--port`. Equivalent environment overrides are `HAARNESS_ROUTER_BIND`, `HAARNESS_ROUTER_HOST`, and `HAARNESS_ROUTER_PORT`.
 
+## Authentication and metrics
+
+```toml
+[auth]
+enabled = true
+router_key_envs = ["HAARNESS_ROUTER_KEY"]
+# Optional: a token that can read /metrics but cannot call models.
+metrics_token_env = "HAARNESS_METRICS_TOKEN"
+```
+
+With authentication enabled, `/v1` and `/metrics` require `Authorization: Bearer <secret>`. `/metrics` accepts any router key or the scrape token; the scrape token is rejected everywhere else. Like every other secret, the token is referenced by environment-variable name, and a missing or empty variable fails startup. With authentication disabled, `/metrics` is as open as `/v1` and `metrics_token_env` is ignored. A Prometheus job reads the token from a file:
+
+```yaml
+scrape_configs:
+  - job_name: haarness-router
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/haarness-metrics-token
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
+## Logs
+
+Logs are JSON lines on standard output. `RUST_LOG` replaces the default `info,tower_http=warn` filter. At `info` each chat completion request produces one `request finished` line; [security](security.md) lists its fields and what is never logged.
+
 ## Secrets
 
-Command-line arguments can be visible to other processes and operational tooling. Do not put router keys, provider keys, or Basic-auth passwords into `--set` values. Pass only their environment-variable names:
+Command-line arguments can be visible to other processes and operational tooling. Do not put router keys, provider keys, metrics tokens, or Basic-auth passwords into `--set` values. Pass only their environment-variable names:
 
 ```bash
 export OPENAI_API_KEY='provider-secret'

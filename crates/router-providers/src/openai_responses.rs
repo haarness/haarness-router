@@ -1,11 +1,14 @@
 use async_stream::try_stream;
 use futures::StreamExt;
-use router_core::{EventStream, ProviderEvent, RouterError};
+use router_core::{ProviderEvent, ProviderStream, RouterError};
 use router_protocol::{ChatCompletionRequest, MessageContent, Usage};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::{sse::request_error, transport::ProviderTransport};
+use crate::{
+    sse::{request_error, upstream_request_id},
+    transport::ProviderTransport,
+};
 
 pub(crate) fn required(model: &str, request: &ChatCompletionRequest) -> bool {
     let version = model
@@ -41,7 +44,7 @@ pub(crate) async fn stream(
     model: &str,
     request: &ChatCompletionRequest,
     cancel: CancellationToken,
-) -> Result<EventStream, RouterError> {
+) -> Result<ProviderStream, RouterError> {
     let body = responses_request(model, request)?;
     let response = http_request
         .json(&body)
@@ -49,8 +52,9 @@ pub(crate) async fn stream(
         .await
         .map_err(request_error)?;
     let response = transport.checked(response).await?;
+    let upstream_request_id = upstream_request_id(response.headers());
     let mut source = transport.sse(response, cancel);
-    Ok(Box::pin(try_stream! {
+    let events = Box::pin(try_stream! {
         let mut tool_index = 0;
         let mut completed = false;
         while let Some(event) = source.next().await {
@@ -107,7 +111,11 @@ pub(crate) async fn stream(
             }
         }
         if !completed { Err(RouterError::upstream(http::StatusCode::BAD_GATEWAY, "OpenAI Responses stream ended before completion"))?; }
-    }))
+    });
+    Ok(ProviderStream {
+        events,
+        upstream_request_id,
+    })
 }
 
 fn responses_request(model: &str, request: &ChatCompletionRequest) -> Result<Value, RouterError> {

@@ -118,7 +118,8 @@ Or request the configured `fast` alias. Aliases are tried in declared order afte
 
 - `POST /v1/chat/completions`: streaming and non-streaming OpenAI-shaped responses.
 - `GET /v1/models`: configured aliases/models plus cached live provider catalogs, including newly released chat models.
-- `/healthz`, `/readyz`, `/metrics`: operational endpoints.
+- `/healthz`, `/readyz`: unauthenticated health checks.
+- `/metrics`: Prometheus metrics, including upstream failures by route and class. With router authentication on it requires a router key or the scrape token from `auth.metrics_token_env`.
 - `/ui`: optional embedded dashboard, model/route explorer, metrics view, OpenAI-compatible playground, and ephemeral router-key administration.
 - Roles: developer, system, user, assistant, tool, and legacy function. Native adapters reject legacy shapes that cannot be translated losslessly.
 - Tools: function tools across all native adapters; custom tools on compatible targets that declare support.

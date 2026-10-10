@@ -36,7 +36,7 @@ The interface includes:
 - A playground for streaming and non-streaming chat, system messages, reasoning controls, function tools, structured output, images, PDFs/files, audio, video, and per-request upstream credentials.
 - Declared model capabilities and ordered alias route maps.
 - Process-local router-key creation, last-use visibility, and revocation.
-- Parsed Prometheus metrics, route health, recent playground activity, and raw metrics.
+- Parsed Prometheus metrics, route health, recent playground activity, and raw metrics. When router authentication is on, the metrics view uses the session router key, as the playground does.
 - A safe settings summary that contains no provider credentials or secret environment-variable names.
 
 ## Configuration

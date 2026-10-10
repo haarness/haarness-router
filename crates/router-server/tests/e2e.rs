@@ -197,6 +197,7 @@ fn config(providers: BTreeMap<String, ProviderConfig>) -> AppConfig {
             enabled: None,
             router_key_envs: vec!["unused-in-programmatic-test".into()],
             allow_upstream_key_header: true,
+            metrics_token_env: None,
         },
         web_ui: WebUiConfig::default(),
         providers,
@@ -339,6 +340,7 @@ async fn keeps_router_and_upstream_credentials_separate() {
         .oneshot(
             Request::builder()
                 .uri("/metrics")
+                .header(header::AUTHORIZATION, "Bearer router-secret")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1208,4 +1210,417 @@ async fn vertex_uses_oauth_bearer_without_google_api_key_header() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert!(String::from_utf8_lossy(&body).contains("vertex-ok"));
     server.abort();
+}
+
+/// Records every upstream request's headers and answers by upstream model:
+/// `fail-500`, `fail-400`, `slow` (no headers for 2 s), `mid-stream-error`
+/// (one chunk, then an error event), or a normal stream. Every response
+/// carries the provider's own `x-request-id`, `upstream-other` for a model
+/// not listed here.
+#[derive(Clone, Default)]
+struct ObservedMock {
+    headers: Arc<Mutex<Vec<HeaderMap>>>,
+}
+
+async fn observed_chat(
+    State(state): State<ObservedMock>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    state.headers.lock().unwrap().push(headers);
+    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let known =
+        ["fail-500", "fail-400", "slow", "mid-stream-error", "ok"].contains(&model.as_str());
+    let response = Response::builder().header(
+        "x-request-id",
+        format!("upstream-{}", if known { &model } else { "other" }),
+    );
+    let first = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n";
+    let rest = match model.as_str() {
+        "fail-500" | "fail-400" => {
+            let status = if model == "fail-500" {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return response
+                .status(status)
+                .body(Body::from("upstream failure"))
+                .unwrap();
+        }
+        "slow" => {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            "data: [DONE]\n\n"
+        }
+        "mid-stream-error" => "data: {\"error\":{\"code\":\"overloaded\"}}\n\n",
+        _ => {
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+        }
+    };
+    response
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(format!("{first}{rest}")))
+        .unwrap()
+}
+
+async fn spawn_observed_mock() -> (String, ObservedMock) {
+    let state = ObservedMock::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let application = AxumRouter::new()
+        .route("/chat/completions", post(observed_chat))
+        .with_state(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, application).await.unwrap();
+    });
+    (format!("http://{address}"), state)
+}
+
+/// A loopback address nothing listens on, for connection failures.
+async fn closed_base_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{address}")
+}
+
+/// `mock` with declared models, so each failure has its own circuit, a
+/// `fast` alias that falls back from `fail-500` to `ok`, and `down`.
+async fn observed_app(auth: AuthStore) -> (AxumRouter, ObservedMock) {
+    let (base_url, mock) = spawn_observed_mock().await;
+    let mut config = config(BTreeMap::from([
+        ("mock".into(), provider(base_url)),
+        ("down".into(), provider(closed_base_url().await)),
+    ]));
+    config.server.first_byte_timeout_ms = 200;
+    config.auth.allow_upstream_key_header = false;
+    for model in ["fail-500", "fail-400", "slow", "mid-stream-error", "ok"] {
+        config
+            .models
+            .insert(format!("mock/{model}"), ModelConfig::default());
+    }
+    config.aliases.insert(
+        "fast".into(),
+        AliasConfig {
+            targets: vec!["mock/fail-500".into(), "mock/ok".into()],
+        },
+    );
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(
+        config,
+        adapters,
+        HashMap::from([
+            ("mock".into(), SecretString::from("provider-secret")),
+            ("down".into(), SecretString::from("provider-secret")),
+        ]),
+    )
+    .unwrap();
+    (
+        router_server::app(router_server::AppState::new(router, auth)),
+        mock,
+    )
+}
+
+fn metrics_request(authorization: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri("/metrics");
+    if let Some(value) = authorization {
+        builder = builder.header(header::AUTHORIZATION, value);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn metrics_follow_router_auth_and_accept_a_scrape_token() {
+    let (app, _) = observed_app(
+        AuthStore::from_keys(["router-secret"], false).with_metrics_token("scrape-secret"),
+    )
+    .await;
+    for (authorization, expected) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some("Bearer wrong-secret"), StatusCode::UNAUTHORIZED),
+        (Some("Basic cm91dGVyLXNlY3JldA=="), StatusCode::UNAUTHORIZED),
+        (Some("Bearer router-secret"), StatusCode::OK),
+        (Some("Bearer scrape-secret"), StatusCode::OK),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(metrics_request(authorization))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{authorization:?}");
+        if expected == StatusCode::OK {
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("haarness_router_requests_total"));
+        } else {
+            assert!(response.headers().contains_key("x-request-id"));
+        }
+    }
+    // The scrape token reads metrics only; it is not a model credential.
+    let mut chat = chat_request("mock/ok", None);
+    chat.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer scrape-secret".parse().unwrap(),
+    );
+    let response = app.oneshot(chat).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // Without router authentication `/metrics` stays open, like the model API.
+    let mut config = config(BTreeMap::new());
+    config.auth = AuthConfig::default();
+    let auth = AuthStore::from_config(&config).unwrap();
+    let router = Router::with_provider_keys(config, HashMap::new(), HashMap::new()).unwrap();
+    let app = router_server::app(router_server::AppState::new(router, auth));
+    let response = app.oneshot(metrics_request(None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn upstream_failures_are_counted_by_configured_route_and_class() {
+    let (app, _) = observed_app(AuthStore::from_keys(["router-secret"], false)).await;
+    for (model, stream, expected) in [
+        ("mock/fail-500", false, StatusCode::INTERNAL_SERVER_ERROR),
+        ("mock/fail-400", false, StatusCode::BAD_REQUEST),
+        ("mock/slow", false, StatusCode::GATEWAY_TIMEOUT),
+        ("mock/mid-stream-error", true, StatusCode::OK),
+        ("down/raw-client-model", false, StatusCode::BAD_GATEWAY),
+        ("fast", false, StatusCode::OK),
+    ] {
+        let mut request = json_chat_request(serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": stream
+        }));
+        request.headers_mut().remove("x-upstream-api-key");
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected, "{model}");
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    }
+    let response = app
+        .oneshot(metrics_request(Some("Bearer router-secret")))
+        .await
+        .unwrap();
+    let metrics = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let sample = |provider: &str, model: &str, alias: &str, class: &str| {
+        format!(
+            "haarness_router_upstream_failures_total{{provider=\"{provider}\",model=\"{model}\",alias=\"{alias}\",class=\"{class}\"}}"
+        )
+    };
+    for (provider, model, alias, class, count) in [
+        ("mock", "fail-500", "_direct", "5xx", 1),
+        ("mock", "fail-500", "fast", "5xx", 1),
+        ("mock", "fail-400", "_direct", "4xx", 1),
+        ("mock", "slow", "_direct", "timeout", 1),
+        ("mock", "mid-stream-error", "_direct", "other", 1),
+        ("down", "_undeclared", "_direct", "connect", 1),
+        ("mock", "ok", "fast", "5xx", 0),
+        ("mock", "_undeclared", "_direct", "connect", 0),
+    ] {
+        let line = format!("{} {count}\n", sample(provider, model, alias, class));
+        assert!(metrics.contains(&line), "missing {line}{metrics}");
+    }
+    assert_eq!(
+        metrics
+            .lines()
+            .filter(|line| line.starts_with("haarness_router_upstream_failures_total{"))
+            .count(),
+        // Five classes for each configured route: mock/_undeclared,
+        // down/_undeclared, five declared models, and two alias targets.
+        5 * 9
+    );
+    assert!(!metrics.contains("raw-client-model"));
+    // The global counters keep their names and meaning.
+    assert!(metrics.contains("haarness_router_errors_total 5\n"));
+    assert!(metrics.contains("haarness_router_requests_total 6\n"));
+}
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl CapturedLogs {
+    /// The test binary's JSON subscriber, shaped like the router binary's.
+    /// It is global because a thread-scoped subscriber misses callsites that
+    /// a parallel test registered first; tests pick out their own lines.
+    fn global() -> &'static Self {
+        static LOGS: std::sync::OnceLock<CapturedLogs> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = Self::default();
+            tracing_subscriber::fmt()
+                .json()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_writer(logs.clone())
+                .init();
+            logs
+        })
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Events with this message whose `field` equals `value`, in order.
+    fn find(&self, message: &str, field: &str, value: &str) -> Vec<serde_json::Value> {
+        self.text()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["fields"]["message"] == message && line["fields"][field] == value)
+            .map(|line| line["fields"].clone())
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn request_ids_and_trace_context_are_logged_but_never_forwarded() {
+    let logs = CapturedLogs::global();
+    let (app, mock) = observed_app(AuthStore::from_keys(["router-secret"], false)).await;
+    let trace = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let traceparent = format!("00-{trace}-00f067aa0ba902b7-01");
+    let request = |model: &str, request_id: Option<&str>, stream: bool| {
+        let mut request = json_chat_request(serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "PROMPT_SENTINEL"}],
+            "stream": stream
+        }));
+        request.headers_mut().remove("x-upstream-api-key");
+        request
+            .headers_mut()
+            .insert("traceparent", traceparent.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("tracestate", "vendor=opaque".parse().unwrap());
+        if let Some(id) = request_id {
+            request
+                .headers_mut()
+                .insert("x-request-id", id.parse().unwrap());
+        }
+        request
+    };
+
+    let mut ids = Vec::new();
+    for (model, request_id, stream, expected) in [
+        ("mock/ok", Some("caller-1:a.b"), true, StatusCode::OK),
+        (
+            "mock/raw-client-model",
+            Some("not safe!"),
+            false,
+            StatusCode::OK,
+        ),
+        (
+            "mock/fail-500",
+            None,
+            false,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        ("fast", Some("caller-2"), false, StatusCode::OK),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(model, request_id, stream))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{model}");
+        ids.push(
+            response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    }
+    let mut unauthorized = request("mock/ok", Some("caller-3"), false);
+    unauthorized.headers_mut().remove(header::AUTHORIZATION);
+    let response = app.oneshot(unauthorized).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()["x-request-id"], "caller-3");
+
+    assert_eq!(ids[0], "caller-1:a.b");
+    assert!(ids[1].starts_with("req_") && ids[2].starts_with("req_"));
+    assert_eq!(ids[3], "caller-2");
+
+    // Third parties see neither the caller's nor the router's identifiers.
+    for headers in mock.headers.lock().unwrap().iter() {
+        for name in ["x-request-id", "traceparent", "tracestate"] {
+            assert!(!headers.contains_key(name), "{name} was forwarded");
+        }
+    }
+
+    // Every request above carried the traceparent: exactly one line each.
+    let summaries = logs.find("request finished", "trace_id", trace);
+    assert_eq!(summaries.len(), 5, "one summary per request: {summaries:?}");
+    let fields = |index: usize| summaries[index].clone();
+    for index in 0..5 {
+        assert!(fields(index)["duration_ms"].is_u64());
+    }
+    assert!(
+        logs.text()
+            .lines()
+            .filter(|line| line.contains("\"request finished\"") && line.contains(trace))
+            .all(|line| line.contains("\"level\":\"INFO\""))
+    );
+    let streamed = fields(0);
+    assert_eq!(streamed["request_id"], "caller-1:a.b");
+    assert_eq!(streamed["alias"], "_direct");
+    assert_eq!(streamed["provider"], "mock");
+    assert_eq!(streamed["model"], "ok");
+    assert_eq!(streamed["status"], 200);
+    assert_eq!(streamed["outcome"], "completed");
+    assert_eq!(streamed["fallbacks"], 0);
+    assert_eq!(streamed["upstream_request_id"], "upstream-ok");
+    assert_eq!(fields(1)["request_id"], ids[1].as_str());
+    assert_eq!(fields(1)["model"], "_undeclared");
+    assert_eq!(fields(1)["upstream_request_id"], "upstream-other");
+    let failed = fields(2);
+    assert_eq!(failed["status"], 500);
+    assert_eq!(failed["outcome"], "failed");
+    assert_eq!(failed["error_code"], "upstream_500");
+    assert_eq!(failed["model"], "fail-500");
+    assert_eq!(failed["upstream_request_id"], "upstream-fail-500");
+    let fallback = fields(3);
+    assert_eq!(fallback["alias"], "fast");
+    assert_eq!(fallback["model"], "ok");
+    assert_eq!(fallback["fallbacks"], 1);
+    assert_eq!(fallback["upstream_request_id"], "upstream-ok");
+    let rejected = fields(4);
+    assert_eq!(rejected["status"], 401);
+    assert_eq!(rejected["outcome"], "rejected");
+    assert!(rejected.get("provider").is_none());
+
+    let routed = logs.find("request routed", "request_id", &ids[1]);
+    assert_eq!(routed[0]["model"], "_undeclared");
+    let text = logs.text();
+    for secret in [
+        "raw-client-model",
+        "PROMPT_SENTINEL",
+        "router-secret",
+        "provider-secret",
+        "vendor=opaque",
+    ] {
+        assert!(!text.contains(secret), "{secret} reached the logs");
+    }
 }

@@ -4,7 +4,8 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use router_core::{
-    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, RouterError,
+    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, ProviderStream,
+    RouterError,
 };
 use router_protocol::{ChatCompletionRequest, Message, MessageContent, Usage};
 use secrecy::{ExposeSecret, SecretString};
@@ -12,7 +13,11 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{attachment::prepare_pdf_fallback, sse::request_error, transport::ProviderTransport};
+use crate::{
+    attachment::prepare_pdf_fallback,
+    sse::{request_error, upstream_request_id},
+    transport::ProviderTransport,
+};
 
 pub struct GeminiAdapter {
     transport: ProviderTransport,
@@ -43,11 +48,25 @@ impl ProviderAdapter for GeminiAdapter {
     async fn stream(
         &self,
         model: &str,
-        mut request: ChatCompletionRequest,
+        request: ChatCompletionRequest,
         capabilities: Capabilities,
         api_key: Option<&SecretString>,
         cancel: CancellationToken,
     ) -> Result<EventStream, RouterError> {
+        Ok(self
+            .open_stream(model, request, capabilities, api_key, cancel)
+            .await?
+            .events)
+    }
+
+    async fn open_stream(
+        &self,
+        model: &str,
+        mut request: ChatCompletionRequest,
+        capabilities: Capabilities,
+        api_key: Option<&SecretString>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream, RouterError> {
         let key = api_key.ok_or_else(|| RouterError::unavailable("provider API key is missing"))?;
         prepare_pdf_fallback(&mut request, capabilities).await?;
         // The router target, not a public alias, determines thinking syntax.
@@ -65,8 +84,9 @@ impl ProviderAdapter for GeminiAdapter {
         };
         let response = request.json(&body).send().await.map_err(request_error)?;
         let response = self.transport.checked(response).await?;
+        let upstream_request_id = upstream_request_id(response.headers());
         let mut source = self.transport.sse(response, cancel);
-        Ok(Box::pin(try_stream! {
+        let events = Box::pin(try_stream! {
             // Gemini sends complete calls, but different calls may arrive in different
             // SSE events. Part positions reset in each event and are not tool indexes.
             let mut tool_indexes: BTreeMap<u32, u32> = BTreeMap::new();
@@ -134,7 +154,11 @@ impl ProviderAdapter for GeminiAdapter {
                     }
                 }
             }
-        }))
+        });
+        Ok(ProviderStream {
+            events,
+            upstream_request_id,
+        })
     }
 }
 

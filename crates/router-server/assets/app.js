@@ -232,8 +232,22 @@ function metric(name, fallback = 0) {
 }
 
 async function refreshMetrics() {
+  // With router authentication on, /metrics takes the same session router key as the playground.
+  const headers = {};
+  if (routerKeyRequired()) {
+    const key = routerKey();
+    if (!key) {
+      $("#metrics-updated").textContent = "Enter a router key to load metrics";
+      return;
+    }
+    headers.authorization = `Bearer ${key}`;
+  }
   try {
-    const response = await fetch("/metrics", { cache: "no-store", credentials: "same-origin" });
+    const response = await fetch("/metrics", { cache: "no-store", credentials: "same-origin", headers });
+    if (response.status === 401) {
+      $("#metrics-updated").textContent = "Router key rejected for metrics";
+      return;
+    }
     if (!response.ok) throw new Error(`Metrics returned HTTP ${response.status}`);
     state.rawMetrics = await response.text();
     state.metrics = parseMetrics(state.rawMetrics);
@@ -710,7 +724,9 @@ async function start() {
   initializePlayground();
   initializeUtilityActions();
   resetResponse();
-  await Promise.all([loadOverview(), refreshMetrics()]);
+  // The overview says whether metrics need a router key.
+  await loadOverview();
+  await refreshMetrics();
   window.setInterval(refreshMetrics, 5000);
   window.setInterval(loadOverview, 30000);
 }
