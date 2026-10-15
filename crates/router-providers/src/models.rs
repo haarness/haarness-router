@@ -268,10 +268,10 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
             metadata.insert("supports_tools".into(), json!(true));
             metadata.insert("supports_vision".into(), json!(true));
         }
-        if entry["thinking"]
-            .as_bool()
-            .unwrap_or(id.starts_with("gemini-3") || id.starts_with("gemini-2.5"))
-        {
+        if entry["thinking"].as_bool().unwrap_or(
+            gemini_generation(id).is_some_and(|generation| generation >= 3)
+                || id.starts_with("gemini-2.5"),
+        ) {
             metadata
                 .entry("supports_reasoning".into())
                 .or_insert(json!(true));
@@ -408,11 +408,24 @@ fn openai_reasoning_efforts(id: &str) -> Vec<&'static str> {
     }
 }
 
+/// The generation a Gemini model id names: 3 for `gemini-3.8-flash`, 4 for
+/// `gemini-4-argon`, nothing for an alias such as `gemini-flash-latest`.
+fn gemini_generation(id: &str) -> Option<u32> {
+    let name = id.rsplit('/').next()?.strip_prefix("gemini-")?;
+    let digits = name
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(name.len());
+    name[..digits].parse().ok()
+}
+
 /// Model-family fallback only; provider-advertised capabilities take precedence.
 pub(crate) fn gemini_reasoning_efforts(id: &str) -> Vec<&'static str> {
+    // Probed 2026-10-15: Gemini 4 Argon answers `minimal` with a 400, as
+    // 3.7/3.8 Flash and 3.1 Pro do; later generations are assumed to follow.
     if id.starts_with("gemini-3.8-flash")
         || id.starts_with("gemini-3.7-flash")
         || id.starts_with("gemini-3.1-pro")
+        || gemini_generation(id).is_some_and(|generation| generation >= 4)
     {
         vec!["low", "medium", "high"]
     } else if id.starts_with("gemini-3-pro") {
@@ -538,6 +551,12 @@ mod tests {
         assert_eq!(model.metadata["context_window"], 1_048_576);
         assert_eq!(
             model.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
+        let argon = model_entry(&config, &json!({"name":"models/gemini-4-argon","displayName":"Gemini 4 Argon","inputTokenLimit":1_048_576,"outputTokenLimit":32_768,"thinking":true,"supportedGenerationMethods":["generateContent","countTokens"]})).unwrap();
+        assert_eq!(argon.metadata["supports_reasoning"], true);
+        assert_eq!(
+            argon.metadata["reasoning_efforts"],
             json!(["low", "medium", "high"])
         );
         for id in [

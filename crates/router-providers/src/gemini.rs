@@ -666,6 +666,7 @@ mod tests {
     #[test]
     fn every_advertised_gemini_effort_uses_its_generation_contract() {
         for model in [
+            "gemini-4-argon",
             "gemini-3.8-flash",
             "gemini-3.5-flash-lite",
             "gemini-3-pro-preview",
@@ -687,6 +688,8 @@ mod tests {
             }
         }
         for (model, effort) in [
+            ("gemini-4-argon", "minimal"),
+            ("gemini-4-argon", "none"),
             ("gemini-3.8-flash", "minimal"),
             ("gemini-3-pro-preview", "medium"),
             ("gemini-2.5-pro", "none"),

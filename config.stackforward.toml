@@ -51,6 +51,7 @@ max_error_body_bytes = 4096
 [models."anthropic/claude-fable-5-1"]
 [models."anthropic/claude-opus-5"]
 [models."anthropic/claude-sonnet-5"]
+[models."gemini/gemini-4-argon"]
 [models."gemini/gemini-3.8-flash"]
 
 [models."openai/gpt-5-nano"]
