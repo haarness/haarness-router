@@ -16,25 +16,29 @@ to [the security policy](https://github.com/haarness/.github/blob/main/SECURITY.
 
 ## Development setup
 
-You need the toolchain pinned in `rust-toolchain.toml` (installed by rustup on first use). The
-[build and run skill](.skills/haarness-router-build-run/SKILL.md) describes the shortest loop and how to
-keep the build cache warm.
+You need a stable Rust toolchain: CI uses 1.94.0 and the workspace declares 1.88 as its minimum. The
+[development guide](docs/development.md) covers build profiles, a credential-free mock setup and the
+layout, and the [build and run skill](.skills/haarness-router-build-run/SKILL.md) describes the shortest
+loop and how to keep the build cache warm.
 
 ```bash
 cp config.example.toml config.toml
-cargo run -- --config config.toml
+export OPENAI_API_KEY='...' ANTHROPIC_API_KEY='...' GEMINI_API_KEY='...'   # every provider in the file
+cargo run --bin haarness-router -- --config config.toml
 ```
 
 ## Checks
 
-CI runs the deterministic suite on every push; run it before pushing:
+Run these before pushing:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
-cargo deny check                     # advisories and dependency licences (deny.toml)
+cargo deny check                     # advisories and dependency licences (deny.toml); needs cargo-deny
 ```
+
+CI runs the first three. See [testing](docs/testing.md) for the full deterministic suite.
 
 Live provider smoke tests are opt-in and capped; see [testing](docs/testing.md). A new provider or
 adapter follows [provider development](docs/providers.md) and comes with black-box tests against a
