@@ -2,6 +2,10 @@
 
 ## Deterministic suite
 
+CI (`.github/workflows/ci.yml`) runs formatting, Clippy and the workspace tests on every push and pull
+request, with Rust 1.94. The release build and the advisory and licence checks run locally; `cargo audit`
+and `cargo deny` come from the `cargo-audit` and `cargo-deny` crates.
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -27,7 +31,7 @@ The full suite adds two-turn tools, a tiny data-URL image, and reasoning for eac
 cargo run --release --bin live-smoke -- --suite full --max-requests 20
 ```
 
-The runner reads the existing Stackforward YAML directly into secret wrappers. It never prints, copies, snapshots, or writes the keys. Model IDs can be overridden with `HAARNESS_E2E_OPENAI_MODEL`, `HAARNESS_E2E_ANTHROPIC_MODEL`, and `HAARNESS_E2E_GEMINI_MODEL`.
+The runner reads the maintainers' credential YAML (`openai_api_key`, `claude_api_key`, `gemini_api_key`; pass its path with `--stackforward-secrets`) directly into secret wrappers. It never prints, copies, snapshots, or writes the keys. `--only openai|anthropic|gemini` and `--only-feature text|tools|image|reasoning` narrow a run. Model IDs can be overridden with `HAARNESS_E2E_OPENAI_MODEL`, `HAARNESS_E2E_ANTHROPIC_MODEL`, and `HAARNESS_E2E_GEMINI_MODEL` (defaults `gpt-5-nano`, `claude-haiku-4-5-20251001`, `gemini-3.5-flash-lite`).
 
 To test a one-time Anthropic credential without changing the YAML or exposing it in process arguments, use the stdin-only override. Disable terminal echo before entering the key interactively:
 
@@ -42,8 +46,9 @@ The override is deliberately rejected unless `--only anthropic` is also set.
 
 For server-owned tools, model discovery, CLI continuation and real TUI
 detach/reattach, run `scripts/test-haarness-attach.py` with the release binaries.
-See [Haarness attach and current models](haarness.md#verification) for setup,
-model selection and the known live Google project-access failure.
+See [Use with Haarness](haarness.md#verification) for setup and model selection,
+and the [2026-09-12 record](records/2026-09-12-haarness-attach-live.md) for the
+last run.
 
 ## Local load test
 
@@ -76,6 +81,6 @@ cargo run --release --bin load-test -- \
   --p99-target-ms 10
 ```
 
-The harness refuses non-loopback endpoints. It measures router-added first-chunk latency from a timestamp emitted inside the mock event and keeps all streams open for the ten-minute soak. The split IPv4/IPv6 configuration avoids exhausting one macOS loopback ephemeral-port pool with the 20,000 client/router and router/provider TCP legs. Measure router peak RSS alongside it with the operating system's process monitor; acceptance is at most 2 GiB with no monotonic post-warm-up growth.
+`load-test` defaults to `--model mock/test`, reads the router key from `HAARNESS_ROUTER_KEY`, and refuses non-loopback endpoints. It measures router-added first-chunk latency from a timestamp emitted inside the mock event and keeps all streams open for the ten-minute soak. The split IPv4/IPv6 configuration avoids exhausting one macOS loopback ephemeral-port pool with the 20,000 client/router and router/provider TCP legs. Measure router peak RSS alongside it with the operating system's process monitor; acceptance is at most 2 GiB with no monotonic post-warm-up growth. The last full run is recorded in [the 2026-08-23 benchmark](records/2026-08-23-local-benchmark.md).
 
 `cargo audit` currently reports the explicitly acknowledged maintenance advisory `RUSTSEC-2026-0192` through the local PDF extraction chain. It is not a vulnerability and has no safe upgrade; `deny.toml` records the exception so it remains visible and reviewable.

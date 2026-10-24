@@ -2,42 +2,40 @@
 
 The Web UI is compiled into `haarness-router` and served by the same Axum process as the OpenAI-compatible API. It adds no Node.js runtime, filesystem asset directory, database, or second listening port.
 
-## Start the prepared local setup
+## Open it
+
+Start the router with any configuration that leaves `web_ui.enabled` on (the default) and open
+`http://127.0.0.1:8080/ui`; `/` redirects there. The dashboard always shares the API's listener, so
+`--port`, `--host` and `--bind` move both:
 
 ```bash
-cd /Users/alex/work/haarness/haarness-router
-./scripts/run-stackforward
+haarness-router --config config.toml --port 9090      # http://127.0.0.1:9090/ui
 ```
 
-To use another address without editing TOML, pass `--port`, `--host` plus `--port`, or a complete `--bind` address:
+Other dashboard settings can be overridden without editing the file:
 
 ```bash
-./scripts/run-stackforward --port 9090
-./scripts/run-stackforward --host 0.0.0.0 --port 9090
-./scripts/run-stackforward --bind 127.0.0.1:9090
-```
-
-The embedded UI and OpenAI-compatible API always share the resulting listener.
-
-Other UI settings may be overridden without editing TOML:
-
-```bash
-./scripts/run-stackforward \
+haarness-router --config config.toml \
   --set web_ui.path=/control \
   --set web_ui.allow_runtime_key_management=false \
   --set web_ui.max_runtime_keys=32
 ```
 
-Open `http://127.0.0.1:8080/ui`. The browser's HTTP Basic prompt uses `HAARNESS_UI_USERNAME` and `HAARNESS_UI_PASSWORD` from the ignored, mode-0600 `.env` file. The OpenAI-compatible playground separately needs a router key; use `HAARNESS_ROUTER_KEY` from the same file or create a runtime key on the API keys screen.
+When `basic_auth_username_env` and `basic_auth_password_env` are set, the browser asks for those
+credentials first. The playground and the metrics view also need a router key when router authentication is
+on: paste a configured key or create a runtime key on **API keys**. The maintainers' launcher,
+`scripts/run-stackforward`, prepares both in its private `.env` (see [development](development.md)).
 
-The interface includes:
+The interface has six views:
 
-- An operational overview with providers, credential readiness, aliases, and circuit states.
-- A playground for streaming and non-streaming chat, system messages, reasoning controls, function tools, structured output, images, PDFs/files, audio, video, and per-request upstream credentials.
-- Declared model capabilities and ordered alias route maps.
-- Process-local router-key creation, last-use visibility, and revocation.
-- Parsed Prometheus metrics, route health, recent playground activity, and raw metrics. When router authentication is on, the metrics view uses the session router key, as the playground does.
-- A safe settings summary that contains no provider credentials or secret environment-variable names.
+- **Overview** — providers, credential readiness, aliases, circuit states and live request activity.
+- **Playground** — streaming and non-streaming chat with system messages, reasoning controls, function
+  tools, structured output, images, PDFs and files, audio, video and an optional per-request upstream key.
+- **Models & routes** — declared model capabilities and each alias's ordered targets.
+- **API keys** — process-local router-key creation, last use and revocation.
+- **Observability** — parsed Prometheus metrics, route health, recent playground activity and the raw
+  exposition.
+- **Settings** — a safe configuration summary with no provider credentials or secret variable names.
 
 ## Configuration
 
@@ -69,8 +67,8 @@ router  -- provider key ------> upstream provider
 
 Bootstrap router keys come from the configured environment variables and cannot be listed or revoked. The UI shows only their count.
 
-A runtime router key is displayed once after creation. The process immediately stores only its SHA-256 digest. Copy it into a client or select “Use in playground”; the browser keeps that selection in `sessionStorage`, not persistent local storage. Runtime keys and their metadata disappear when the router restarts.
+A runtime router key is displayed once after creation. The process immediately stores only its SHA-256 digest. **Copy & use in playground** copies it and selects it for the playground; the browser keeps that selection in `sessionStorage`, not persistent local storage. Runtime keys and their metadata disappear when the router restarts.
 
-The optional playground upstream-key field sends `X-Upstream-API-Key` for that request only. It is not saved, and the router accepts it only for exact `provider/model` targets. It is translated to the provider's configured authentication scheme and cannot fall back to a server-owned provider key.
+The optional playground upstream-key field sends `X-Upstream-API-Key` for that request only, so it works only when `auth.allow_upstream_key_header = true`. It is not saved, and the router accepts it only for exact `provider/model` targets. It is translated to the provider's configured authentication scheme and cannot fall back to a server-owned provider key.
 
 The Web UI never supports reading or editing provider credentials. Change provider secret environment variables outside the process and restart the router to rotate them.
