@@ -153,7 +153,7 @@ Desktop, **/providers → Connect Haarness Router** in the terminal UI, or
 | `router-server` | The Axum HTTP/SSE surface, metrics and the embedded dashboard. |
 | `haarness-router` | The server binary, plus the `live-smoke`, `mock-provider` and `load-test` tools. |
 
-[Haarness Cloud](https://github.com/haarness/haarness-cloud) builds its managed, metered router on
+[Haarness Cloud](https://haarness.ai/product/cloud) builds its managed, metered router on
 `router-protocol`, `router-core` and `router-providers`; nothing billing-related lives here.
 
 ## Documentation
@@ -172,9 +172,9 @@ The [docs index](docs/README.md) lists every page. The most used:
 | --- | --- |
 | **[haarness](https://github.com/haarness/haarness)** | The agent, terminal UI, Desktop, server and SDKs. Apache 2.0. |
 | **[haarness-router](https://github.com/haarness/haarness-router)** | This repository: a stateless, OpenAI-compatible model router you can host yourself. MIT. |
-| **[haarness-cloud](https://github.com/haarness/haarness-cloud)** | Haarness Cloud: accounts, hosted sessions, the attach gateway, the managed router and billing. |
-| **[haarness-ios](https://github.com/haarness/haarness-ios)** | Haarness for iPhone and iPad. |
-| **[haarness-android](https://github.com/haarness/haarness-android)** | Haarness for Android phones and tablets. |
+
+[Haarness Cloud](https://haarness.ai/product/cloud) is the hosted service at haarness.ai. The phone apps for
+[iPhone and iPad](https://haarness.ai/product/ios) and [Android](https://haarness.ai/product/android) are coming soon.
 
 ## Contributing
 
