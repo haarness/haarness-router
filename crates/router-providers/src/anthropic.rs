@@ -627,19 +627,25 @@ fn anthropic_message(message: &Message) -> Result<Value, RouterError> {
     Ok(json!({"role": role, "content": content}))
 }
 
+/// Claude refuses a text block that is empty or only whitespace, such as the
+/// one OpenAI-style clients send beside a photo that has no text, so blank
+/// text is left out; it says nothing.
 fn content_blocks(message: &Message) -> Result<Vec<Value>, RouterError> {
     let mut blocks = Vec::new();
     match &message.content {
-        Some(MessageContent::Text(text)) if !text.is_empty() => {
+        Some(MessageContent::Text(text)) if !text.trim().is_empty() => {
             blocks.push(json!({"type": "text", "text": text}));
         }
         Some(MessageContent::Text(_)) | None => {}
         Some(MessageContent::Parts(parts)) => {
             for part in parts {
                 let mut block = match part.kind.as_str() {
-                    "text" => {
-                        json!({"type": "text", "text": part.text.as_deref().unwrap_or_default()})
-                    }
+                    "text" => match part.text.as_deref() {
+                        Some(text) if !text.trim().is_empty() => {
+                            json!({"type": "text", "text": text})
+                        }
+                        _ => continue,
+                    },
                     "image_url" => {
                         let url = &part
                             .image_url
@@ -736,9 +742,16 @@ fn parse_data_url(value: &str) -> Result<(&str, &str), RouterError> {
     let (metadata, data) = payload
         .split_once(',')
         .ok_or_else(|| RouterError::invalid("malformed data URL", "messages.content"))?;
-    let media_type = metadata.strip_suffix(";base64").ok_or_else(|| {
-        RouterError::invalid("data URL must use base64 encoding", "messages.content")
-    })?;
+    // `data:image/jpeg;name=photo.jpg;base64,` names the file too; the media
+    // type is what comes before the first parameter.
+    let mut metadata = metadata.split(';');
+    let media_type = metadata.next().unwrap_or_default();
+    if !metadata.any(|parameter| parameter == "base64") {
+        return Err(RouterError::invalid(
+            "data URL must use base64 encoding",
+            "messages.content",
+        ));
+    }
     Ok((media_type, data))
 }
 
@@ -1020,6 +1033,44 @@ mod tests {
         let body = anthropic_request("test", &request).unwrap();
         assert_eq!(body["messages"][0]["content"][0]["signature"], "opaque");
         assert_eq!(body["messages"][0]["content"][1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn a_photo_without_text_reaches_claude_without_a_blank_text_block() {
+        let photo = json!({"type":"image_url","image_url":{
+            "url":"data:image/jpeg;name=photo-1.jpg;base64,/9j/4AAQ"
+        }});
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/test",
+            "messages": [
+                {"role":"user", "content":[{"type":"text","text":""}, photo]},
+                {"role":"assistant", "content":"A white app icon."},
+                {"role":"user", "content":[{"type":"text","text":" \n"}, photo, {"type":"text","text":"and this?"}]}
+            ]
+        }))
+        .unwrap();
+        let body = anthropic_request("test", &request).unwrap();
+        let image = json!({"type":"image","source":{
+            "type":"base64","media_type":"image/jpeg","data":"/9j/4AAQ"
+        }});
+        assert_eq!(body["messages"][0]["content"], json!([image]));
+        assert_eq!(
+            body["messages"][2]["content"],
+            json!([image, {"type":"text","text":"and this?"}])
+        );
+    }
+
+    #[test]
+    fn a_data_url_without_base64_is_refused() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/test",
+            "messages": [{"role":"user", "content":[{"type":"image_url","image_url":{
+                "url":"data:image/png;name=base64.png,iVBORw0KGgo="
+            }}]}]
+        }))
+        .unwrap();
+        let error = anthropic_request("test", &request).unwrap_err();
+        assert!(error.body.message.contains("base64"), "{error:?}");
     }
 
     #[test]

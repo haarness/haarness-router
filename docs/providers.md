@@ -118,6 +118,10 @@ named 400. This follows Anthropic's
 Claude Fable 5.1 and Mythos 5.1 accept `auto` and `none` tool choice; a forced tool choice returns a named
 400 because those models do not support it.
 
+Claude refuses a text block that is empty or only whitespace, so blank text parts are left out: a photo sent
+with an empty text part beside it reaches Claude as the photo alone. A data URL may carry parameters before
+`;base64` (`data:image/jpeg;name=photo.jpg;base64,…`); the media type is what comes before the first one.
+
 ### Gemini
 
 Gemini 3 and later use `thinkingLevel`, with the levels each generation accepts: Gemini 4 Argon, 3.8 and 3.7
