@@ -16,8 +16,8 @@ http.workspace = true
 infer.workspace = true
 pdf-extract.workspace = true
 reqwest.workspace = true
-router-core = { version = "0.1.12", path = "../router-core" }
-router-protocol = { version = "0.1.12", path = "../router-protocol" }
+router-core = { version = "0.1.13", path = "../router-core" }
+router-protocol = { version = "0.1.13", path = "../router-protocol" }
 secrecy.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
