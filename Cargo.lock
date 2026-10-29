@@ -746,6 +746,7 @@ dependencies = [
  "base64",
  "clap",
  "futures",
+ "nu-ansi-term",
  "png",
  "reqwest",
  "router-core",

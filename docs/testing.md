@@ -31,7 +31,7 @@ The full suite adds two-turn tools, a tiny data-URL image, and reasoning for eac
 cargo run --release --bin live-smoke -- --suite full --max-requests 20
 ```
 
-The runner reads the maintainers' credential YAML (`openai_api_key`, `claude_api_key`, `gemini_api_key`; pass its path with `--stackforward-secrets`) directly into secret wrappers. It never prints, copies, snapshots, or writes the keys. `--only openai|anthropic|gemini` and `--only-feature text|tools|image|reasoning` narrow a run. Model IDs can be overridden with `HAARNESS_E2E_OPENAI_MODEL`, `HAARNESS_E2E_ANTHROPIC_MODEL`, and `HAARNESS_E2E_GEMINI_MODEL` (defaults `gpt-5-nano`, `claude-haiku-4-5-20251001`, `gemini-3.5-flash-lite`).
+The runner reads the maintainers' credential YAML (`openai_api_key`, `claude_api_key`, `gemini_api_key`; pass its path with `--stackforward-secrets`) directly into secret wrappers, or, with `--keys-from-env`, the standard `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) variables; with `--only`, only that provider's key is needed. It never prints, copies, snapshots, or writes the keys. `--only openai|anthropic|gemini` and `--only-feature text|tools|image|reasoning` narrow a run. Model IDs can be overridden with `HAARNESS_E2E_OPENAI_MODEL`, `HAARNESS_E2E_ANTHROPIC_MODEL`, and `HAARNESS_E2E_GEMINI_MODEL` (defaults `gpt-5-nano`, `claude-haiku-4-5-20251001`, `gemini-3.5-flash-lite`).
 
 To test a one-time Anthropic credential without changing the YAML or exposing it in process arguments, use the stdin-only override. Disable terminal echo before entering the key interactively:
 

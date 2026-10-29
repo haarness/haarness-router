@@ -13,8 +13,8 @@ use axum::{
     routing::post,
 };
 use router_core::{
-    AliasConfig, AppConfig, AuthConfig, AuthStore, ModelConfig, ProviderConfig, ProviderKind,
-    Router, ServerConfig, WebUiConfig,
+    AliasConfig, AppConfig, AuthConfig, AuthStore, ConfigSource, ModelConfig, ProviderConfig,
+    ProviderKind, Router, STANDARD_PROVIDERS, ServerConfig, WebUiConfig,
 };
 use secrecy::SecretString;
 use tower::ServiceExt;
@@ -1623,4 +1623,147 @@ async fn request_ids_and_trace_context_are_logged_but_never_forwarded() {
     ] {
         assert!(!text.contains(secret), "{secret} reached the logs");
     }
+}
+
+async fn body_json(response: Response) -> serde_json::Value {
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+fn open_chat(model: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]}}"#
+        )))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_router_without_providers_serves_its_dashboard_and_names_the_keys_to_set() {
+    let config = AppConfig::from_environment(&["providers={}".into()], &[]).unwrap();
+    assert!(config.providers.is_empty());
+    let auth = AuthStore::from_config(&config).unwrap();
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::new(config, adapters).unwrap();
+    let app = router_server::app(
+        router_server::AppState::try_new(router, auth)
+            .unwrap()
+            .with_config_source(ConfigSource::Environment),
+    );
+
+    let models = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(models.status(), StatusCode::OK);
+    assert_eq!(body_json(models).await["data"], serde_json::json!([]));
+
+    let overview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ui/api/overview")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(overview.status(), StatusCode::OK);
+    let overview = body_json(overview).await;
+    assert_eq!(overview["providers"], serde_json::json!([]));
+    assert_eq!(overview["discovered_models"], serde_json::json!([]));
+    assert_eq!(overview["config"]["source"], "environment");
+    assert_eq!(overview["config"]["path"], serde_json::Value::Null);
+    let variables = overview["config"]["key_variables"].as_array().unwrap();
+    assert_eq!(variables.len(), STANDARD_PROVIDERS.len());
+    assert_eq!(variables[0]["provider"], "openai");
+    assert_eq!(
+        variables[0]["variables"],
+        serde_json::json!(["OPENAI_API_KEY"])
+    );
+    assert_eq!(variables[0]["configured"], false);
+    assert_eq!(
+        variables[2]["variables"],
+        serde_json::json!(["GEMINI_API_KEY", "GOOGLE_API_KEY"])
+    );
+
+    let index = app
+        .clone()
+        .oneshot(Request::builder().uri("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(index.status(), StatusCode::OK);
+
+    // A provider the router knows by name says which variable it needs.
+    let named = app.clone().oneshot(open_chat("gemini/x")).await.unwrap();
+    assert_eq!(named.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(named).await["error"].clone();
+    assert_eq!(error["type"], "invalid_request_error");
+    assert_eq!(error["code"], "provider_not_configured");
+    assert_eq!(error["param"], "model");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("GEMINI_API_KEY or GOOGLE_API_KEY"),
+        "{message}"
+    );
+
+    // Anything else lists every variable the router looks for.
+    let other = app.clone().oneshot(open_chat("fast")).await.unwrap();
+    assert_eq!(other.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(other).await["error"].clone();
+    assert_eq!(error["code"], "no_providers_configured");
+    let message = error["message"].as_str().unwrap();
+    for provider in STANDARD_PROVIDERS {
+        for variable in provider.key_variables {
+            assert!(message.contains(variable), "{variable}: {message}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_file_configuration_keeps_unknown_providers_and_reports_its_path() {
+    let (base_url, _) = spawn_mock(StatusCode::OK).await;
+    let config = config(BTreeMap::from([("mock".into(), provider(base_url))]));
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(config, adapters, HashMap::new()).unwrap();
+    let app = router_server::app(
+        router_server::AppState::new(router, AuthStore::from_keys(["router-secret"], false))
+            .with_config_source(ConfigSource::File("/etc/haarness/router.toml".into())),
+    );
+    let overview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ui/api/overview")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let overview = body_json(overview).await;
+    assert_eq!(overview["config"]["source"], "file");
+    assert_eq!(overview["config"]["path"], "/etc/haarness/router.toml");
+
+    // A file that leaves a provider out is answered as before.
+    let response = app
+        .oneshot(chat_request("openai/gpt-5-nano", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await["error"].clone();
+    assert_eq!(error["code"], "invalid_request");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown provider openai")
+    );
 }

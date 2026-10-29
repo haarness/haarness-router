@@ -13,7 +13,7 @@ use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use router_core::{
     AppConfig, AuthConfig, AuthStore, ModelConfig, ProviderConfig, ProviderKind, Router,
-    ServerConfig, WebUiConfig,
+    ServerConfig, StandardProvider, WebUiConfig,
 };
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -45,6 +45,10 @@ struct Args {
         default_value = "/Users/alex/work/stackforward/robowork/robowork-backend-stack/environments/prod/group_vars/all.yml"
     )]
     stackforward_secrets: PathBuf,
+    /// Read the keys from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and
+    /// `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) instead of the credential YAML.
+    #[arg(long)]
+    keys_from_env: bool,
     #[arg(long, value_enum, default_value = "minimal")]
     suite: Suite,
     #[arg(long, value_parser = ["openai", "anthropic", "gemini"])]
@@ -104,10 +108,13 @@ async fn main() -> Result<()> {
     if args.max_requests == 0 || args.max_requests > HARD_MAX_REQUESTS {
         bail!("--max-requests must be between 1 and {HARD_MAX_REQUESTS}");
     }
-    let raw = std::fs::read_to_string(&args.stackforward_secrets)
-        .with_context(|| format!("failed to read {}", args.stackforward_secrets.display()))?;
-    let mut secrets: StackforwardSecrets =
-        serde_yaml::from_str(&raw).context("failed to parse Stackforward secret YAML")?;
+    let mut secrets = if args.keys_from_env {
+        environment_secrets(args.only.as_deref())?
+    } else {
+        let raw = std::fs::read_to_string(&args.stackforward_secrets)
+            .with_context(|| format!("failed to read {}", args.stackforward_secrets.display()))?;
+        serde_yaml::from_str(&raw).context("failed to parse Stackforward secret YAML")?
+    };
     if args.anthropic_key_stdin {
         if args.only.as_deref() != Some("anthropic") {
             bail!("--anthropic-key-stdin requires --only anthropic");
@@ -205,6 +212,30 @@ async fn main() -> Result<()> {
         HARD_MAX_REQUESTS
     );
     Ok(())
+}
+
+/// The keys of the providers under test from their standard variables. A
+/// provider left out by `--only` needs none.
+fn environment_secrets(only: Option<&str>) -> Result<StackforwardSecrets> {
+    let key = |provider: &str| -> Result<String> {
+        if only.is_some_and(|only| only != provider) {
+            return Ok(String::new());
+        }
+        let standard = StandardProvider::named(provider).expect("standard provider");
+        let lookup = |name: &str| std::env::var(name).ok();
+        let variable = standard.key_variable(lookup).ok_or_else(|| {
+            anyhow!(
+                "--keys-from-env needs {} for {provider}",
+                standard.key_variables.join(" or ")
+            )
+        })?;
+        std::env::var(variable).with_context(|| format!("{variable} is not valid UTF-8"))
+    };
+    Ok(StackforwardSecrets {
+        openai: key("openai")?,
+        claude: key("anthropic")?,
+        gemini: key("gemini")?,
+    })
 }
 
 fn live_config(models: &[(&str, &str)]) -> AppConfig {

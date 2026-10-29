@@ -1,6 +1,6 @@
 # Observability
 
-The router reports through three channels: health endpoints, Prometheus metrics and JSON logs. None of
+The router reports through three channels: health endpoints, Prometheus metrics and logs. None of
 them carries prompts, attachments, tool arguments, upstream bodies, credentials or the raw model string a
 client sent; label values come only from the configuration.
 
@@ -57,7 +57,11 @@ scrape_configs:
 
 ## Logs
 
-Logs are JSON lines on standard output. `RUST_LOG` replaces the default `info,tower_http=warn` filter.
+Logs go to standard error. When it is a terminal they are readable text, after a short startup summary;
+otherwise (a service manager, a container, a pipe) they are JSON lines, the first one
+`haarness router listening` with the address, version, configuration source and provider count.
+`--log-format text|json` or `HAARNESS_ROUTER_LOG_FORMAT` overrides the choice. `RUST_LOG` replaces the
+default `info,tower_http=warn` filter.
 
 At `info`, each chat completion request writes one `request finished` line with: the request ID, the
 caller's W3C trace ID when a valid `traceparent` arrived, alias (`_direct` for an exact model), provider,

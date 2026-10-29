@@ -11,8 +11,8 @@ chat history, so clients attach to the Haarness server, never to the router dire
 
 ## Connect
 
-Start the router (see the [quick start](../README.md#quick-start)). A self-hosted router needs no access key
-by default.
+Start the router (see the [quick start](../README.md#quick-start)). On a terminal it prints the command that
+connects Haarness to it, with its real address. A self-hosted router needs no access key by default.
 
 - **Desktop:** **Settings → Providers → Connect Haarness Router**.
 - **Terminal UI:** **/providers → Connect Haarness Router**.
@@ -68,7 +68,10 @@ Use the full name: `openai/gpt-6-astra` selects Haarness's own direct OpenAI pro
 `--provider router`.
 
 Haarness lists what the router's `GET /v1/models` returns — configured aliases and models plus each
-provider's live catalog — so a newly released model shows up without changing either side. See
+provider's live catalog — so a newly released model shows up without changing either side. A router started
+from provider keys alone declares no aliases; add one with `--set`, for example
+`haarness-router --set 'aliases.fast.targets=["openai/gpt-5-nano","gemini/gemini-3.5-flash-lite"]'`, and it
+appears as `router/fast`. See
 [model discovery](api.md#model-discovery). The example configurations declare GPT-6 Astra, GPT-5.6
 Sol/Terra/Luna, Claude Fable 5.1, Opus 5 and Sonnet 5, Gemini 4 Argon and Gemini 3.8 Flash beside the
 low-cost models the `fast` alias uses; how each provider's reasoning and tools are translated is in

@@ -74,8 +74,9 @@ playground and process-local router keys — nothing extra to deploy.
 </td>
 <td valign="top">
 
-**Operable from day one.** Layered TOML with typed `--set` overrides validated before startup, Prometheus
-metrics with bounded labels, one JSON log line per chat request, and request IDs you can correlate.
+**Operable from day one.** Starts from your provider keys alone, or from layered TOML with typed `--set`
+overrides validated before startup. Prometheus metrics with bounded labels, one log line per chat request
+(JSON when not on a terminal), and request IDs you can correlate.
 
 </td>
 </tr>
@@ -83,24 +84,56 @@ metrics with bounded labels, one JSON log line per chat request, and request IDs
 
 ## Quick start
 
-There are no prebuilt binaries or container images yet: build it with a stable Rust toolchain (CI uses
-1.94; the workspace declares 1.88 as its minimum).
+Install the router with one command. It goes into `~/.local/bin` (on Windows, `%LOCALAPPDATA%\Haarness\bin`):
 
 ```bash
-git clone https://github.com/haarness/haarness-router && cd haarness-router
-cp config.example.toml config.toml
-export OPENAI_API_KEY='...' ANTHROPIC_API_KEY='...' GEMINI_API_KEY='...'
-cargo run --release --bin haarness-router -- --config config.toml
+curl -fsSL https://haarness.ai/install-router.sh | sh
 ```
 
-Every provider in the file needs its key variable set, or startup stops and names the missing one. The
-router listens on `127.0.0.1:8080`, with the dashboard at <http://127.0.0.1:8080/ui>. Call an exact model,
-or the `fast` alias from the example configuration:
+```powershell
+irm https://haarness.ai/install-router.ps1 | iex     # Windows PowerShell
+```
+
+Then set the API key of any provider you use and start it. No configuration file is needed: the router
+sets up one provider for each key it finds and lists every model those providers offer.
+
+```bash
+export OPENAI_API_KEY='...'          # and/or ANTHROPIC_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, …
+haarness-router
+```
+
+```text
+  Haarness Router <version>
+
+  API        http://127.0.0.1:8080/v1
+  Dashboard  http://127.0.0.1:8080/ui
+  Providers  openai
+  Config     provider keys in the environment
+
+  Connect Haarness:
+  haarness provider connect-router http://127.0.0.1:8080
+```
+
+It listens on loopback only. Without any key it still starts and its dashboard says what to set; the keys
+it looks for are listed in [configuration](docs/configuration.md#starting-without-a-configuration-file).
+Call any model as `provider/model`:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"openai/gpt-5-nano","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+For aliases with fallback, declared models and every other setting, start from
+[`config.example.toml`](config.example.toml): save it as `config.toml` in the folder you start the router
+from, or pass `--config <file>`. Every provider in a file needs its key variable set, or startup stops and
+names the missing one.
+
+**From source**, with a stable Rust toolchain (CI uses 1.94; the workspace declares 1.88 as its minimum):
+
+```bash
+git clone https://github.com/haarness/haarness-router && cd haarness-router
+cargo run --release --bin haarness-router
 ```
 
 Any OpenAI client works unchanged — see the [Python](examples/openai_python.py) and
@@ -111,7 +144,7 @@ import os
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key=os.getenv("HAARNESS_ROUTER_KEY", "unused"))
-client.chat.completions.create(model="fast", messages=[{"role": "user", "content": "Hi"}])
+client.chat.completions.create(model="openai/gpt-5-nano", messages=[{"role": "user", "content": "Hi"}])
 ```
 
 A self-hosted router accepts requests without a key by default. Before exposing it beyond loopback, start
@@ -134,9 +167,9 @@ client  -- Authorization: Bearer <router key, optional> -->  haarness-router  --
 | `GET /metrics` | Prometheus text; behind the router key (or a scrape-only token) when authentication is on. |
 | `/ui` | The embedded dashboard; optional HTTP Basic protection, or `web_ui.enabled = false` to remove it. |
 
-Configuration is one TOML file plus repeatable `--set`/`--unset` overrides and `--host`/`--port`/`--bind`;
-values only *name* the environment variables that hold secrets. See [configuration](docs/configuration.md)
-and the [API reference](docs/api.md).
+Configuration is the provider keys in the environment, or one TOML file, plus repeatable `--set`/`--unset`
+overrides and `--host`/`--port`/`--bind`; values only *name* the environment variables that hold secrets.
+See [configuration](docs/configuration.md) and the [API reference](docs/api.md).
 
 **From Haarness**, connect the router by address — **Settings → Providers → Connect Haarness Router** in
 Desktop, **/providers → Connect Haarness Router** in the terminal UI, or
