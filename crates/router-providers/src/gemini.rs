@@ -372,7 +372,9 @@ fn gemini_request(request: &ChatCompletionRequest) -> Result<Value, RouterError>
                         ));
                     }
                 };
-                thinking["thinkingBudget"] = json!(budget);
+                let limit = request.max_completion_tokens.or(request.max_tokens);
+                thinking["thinkingBudget"] =
+                    json!(within_output_limit(&request.model, budget, limit));
             } else {
                 thinking["thinkingLevel"] = Value::String(effort.to_owned());
             }
@@ -386,6 +388,31 @@ fn gemini_request(request: &ChatCompletionRequest) -> Result<Value, RouterError>
         body["generationConfig"] = generation;
     }
     Ok(body)
+}
+
+/// A Gemini 2.5 thinking budget that leaves the answer room: thinking counts
+/// against the response's output limit, so with a limit set it gets at most
+/// half of it. Thinking that was asked for stays on unless half the limit is
+/// less than the model thinks at all: 2.5 Pro, which cannot turn thinking
+/// off, then thinks its minimum of 128 tokens, and a model that can turn it
+/// off (Flash-Lite thinks at least 512 tokens when it thinks) does.
+fn within_output_limit(model: &str, budget: u64, limit: Option<u64>) -> u64 {
+    let pro = model.starts_with("gemini-2.5-pro");
+    let least = if pro {
+        128
+    } else if model.contains("flash-lite") {
+        512
+    } else {
+        1
+    };
+    match limit.filter(|limit| *limit > 0) {
+        Some(limit) if budget > 0 => match budget.min(limit / 2) {
+            half if half >= least => half,
+            _ if pro => least,
+            _ => 0,
+        },
+        _ => budget,
+    }
 }
 
 fn gemini_parts(message: &Message) -> Result<Vec<Value>, RouterError> {
@@ -634,7 +661,7 @@ fn normalize_finish(reason: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use router_protocol::ChatCompletionRequest;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::gemini_request;
 
@@ -661,6 +688,54 @@ mod tests {
         );
         assert_eq!(plain.completion_tokens, 2);
         assert_eq!(plain.total_tokens, 5);
+    }
+
+    #[test]
+    fn a_thinking_budget_leaves_at_least_half_the_output_limit_for_the_answer() {
+        let budget = |model: &str, effort: &str, limit: Value| {
+            let mut request = json!({"model":model,"messages":[{"role":"user","content":"hi"}],"reasoning_effort":effort});
+            if !limit.is_null() {
+                request["max_tokens"] = limit;
+            }
+            let body = gemini_request(&serde_json::from_value(request).unwrap()).unwrap();
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"].clone()
+        };
+        // Without a limit, as before.
+        assert_eq!(budget("gemini-2.5-pro", "low", Value::Null), 2_048);
+        assert_eq!(budget("gemini-2.5-flash", "high", Value::Null), 24_576);
+        // Half of the limit at most: a short verdict within 2048 tokens keeps
+        // room after thinking, and thinking that was asked for stays on.
+        assert_eq!(budget("gemini-2.5-pro", "low", json!(2_048)), 1_024);
+        assert_eq!(budget("gemini-2.5-flash", "low", json!(2_048)), 1_024);
+        assert_eq!(budget("gemini-2.5-flash-lite", "low", json!(2_048)), 1_024);
+        assert_eq!(budget("gemini-2.5-flash", "high", json!(8_192)), 4_096);
+        assert_eq!(budget("gemini-2.5-flash", "low", json!(32_000)), 2_048);
+        // `max_completion_tokens` wins over `max_tokens`, as for the limit.
+        let body = gemini_request(
+            &serde_json::from_value(json!({"model":"gemini-2.5-pro","messages":[],"reasoning_effort":"low","max_tokens":32_000,"max_completion_tokens":1_000})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 1_000);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            500
+        );
+        // Below a model's least: 2.5 Pro thinks its 128, and a model that can
+        // stop thinking stops rather than take more than half the limit.
+        assert_eq!(budget("gemini-2.5-pro", "low", json!(100)), 128);
+        assert_eq!(budget("gemini-2.5-flash-lite", "low", json!(600)), 0);
+        assert_eq!(budget("gemini-2.5-flash", "low", json!(1)), 0);
+        // Thinking asked off stays off.
+        assert_eq!(budget("gemini-2.5-flash", "none", json!(2_048)), 0);
+        // A budget the client chose itself is sent as chosen.
+        let body = gemini_request(
+            &serde_json::from_value(json!({"model":"gemini-2.5-flash","messages":[],"reasoning":{"max_tokens":3_000},"max_tokens":2_048})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            3_000
+        );
     }
 
     #[test]

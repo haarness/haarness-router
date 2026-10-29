@@ -127,7 +127,11 @@ with an empty text part beside it reaches Claude as the photo alone. A data URL 
 Gemini 3 and later use `thinkingLevel`, with the levels each generation accepts: Gemini 4 Argon, 3.8 and 3.7
 Flash and 3.1 Pro offer `low`, `medium` and `high`; Gemini 3 Pro `low` and `high`; other Gemini 3 models also
 `minimal`. Gemini 2.5 uses `thinkingBudget` (`low` 2,048, `medium` 8,192, `high` 24,576; `none` maps to zero
-only where thinking can be turned off). An unsupported level is refused before Google is called. See
+only where thinking can be turned off). Thinking counts against the output limit, so with `max_tokens` or
+`max_completion_tokens` set an effort's budget is at most half of it and a short answer keeps room; it stays on
+unless half the limit is less than the model thinks at all, when 2.5 Pro thinks its minimum of 128 tokens and
+Flash and Flash-Lite (512 at least) stop thinking. A `reasoning.max_tokens` budget is sent as given. An
+unsupported level is refused before Google is called. See
 Google's [thinking guide](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
 
 Gemini usage counts candidate and thought tokens as completion tokens, with reasoning as a subset and cached
