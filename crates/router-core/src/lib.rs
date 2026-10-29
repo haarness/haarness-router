@@ -8,8 +8,8 @@ mod router;
 pub use capabilities::{Capabilities, Requirements};
 pub use circuit::{CircuitBreaker, CircuitState};
 pub use config::{
-    AliasConfig, AppConfig, AuthConfig, ModelConfig, ProviderConfig, ProviderKind,
-    ProviderProtocol, ServerConfig, WebUiConfig,
+    AliasConfig, AppConfig, AuthConfig, ConfigSource, ModelConfig, ProviderConfig, ProviderKind,
+    ProviderProtocol, STANDARD_PROVIDERS, ServerConfig, StandardProvider, WebUiConfig,
 };
 pub use error::RouterError;
 pub use observability::{

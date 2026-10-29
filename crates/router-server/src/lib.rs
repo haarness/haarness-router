@@ -19,7 +19,8 @@ use axum::{
 };
 use futures::StreamExt;
 use router_core::{
-    AuthStore, ProviderEvent, RouteLabels, RoutedStream, Router, RouterError, is_safe_request_id,
+    AuthStore, ConfigSource, ProviderEvent, RouteLabels, RoutedStream, Router, RouterError,
+    STANDARD_PROVIDERS, StandardProvider, is_safe_request_id,
 };
 use router_protocol::{
     AssistantMessage, ChatCompletionRequest, ChatCompletionResponse, Choice, FunctionCall,
@@ -48,6 +49,7 @@ pub struct AppState {
     max_request_bytes: usize,
     created: u64,
     ui: UiState,
+    config_source: Option<ConfigSource>,
 }
 
 impl AppState {
@@ -69,7 +71,16 @@ impl AppState {
             max_request_bytes,
             created: unix_timestamp(),
             ui,
+            config_source: None,
         })
+    }
+
+    /// Records where the configuration came from, for the dashboard and for
+    /// requests that name a provider the router has not set up.
+    #[must_use]
+    pub fn with_config_source(mut self, source: ConfigSource) -> Self {
+        self.config_source = Some(source);
+        self
     }
 }
 
@@ -147,6 +158,9 @@ async fn handle_chat(
         })?;
     let chat_request: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|error| RouterError::invalid(format!("invalid JSON request: {error}"), "body"))?;
+    if let Some(error) = setup_error(state, &chat_request.model) {
+        return Err(error);
+    }
     let wants_stream = chat_request.stream;
     let include_usage = chat_request.wants_usage_stream();
     let cancel = CancellationToken::new();
@@ -230,6 +244,58 @@ async fn handle_chat(
             }
         }
     }
+}
+
+/// A request the router cannot serve until a provider is set up, answered
+/// with what to set instead of a bare unknown-provider error.
+fn setup_error(state: &AppState, model: &str) -> Option<RouterError> {
+    let config = state.router.config();
+    if config.aliases.contains_key(model) {
+        return None;
+    }
+    if matches!(state.config_source, Some(ConfigSource::Environment))
+        && let Some(standard) = model
+            .split_once('/')
+            .map(|(provider, _)| provider)
+            .filter(|provider| !config.providers.contains_key(*provider))
+            .and_then(StandardProvider::named)
+    {
+        return Some(not_configured(
+            format!(
+                "Provider {} is not set up on this router: set {} where the router runs, then restart it.",
+                standard.name,
+                standard.key_variables.join(" or ")
+            ),
+            "provider_not_configured",
+        ));
+    }
+    if !config.providers.is_empty() {
+        return None;
+    }
+    let message = match &state.config_source {
+        Some(ConfigSource::Environment) => format!(
+            "This router has no model providers yet: set a provider API key where the router runs, then restart it. It looks for {}.",
+            STANDARD_PROVIDERS
+                .iter()
+                .flat_map(|provider| provider.key_variables.iter().copied())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Some(ConfigSource::File(path)) => format!(
+            "This router has no model providers: add one under [providers] in {}, then restart it.",
+            path.display()
+        ),
+        Some(ConfigSource::Stdin) | None => {
+            "This router has no model providers: add one under [providers] in its configuration, then restart it.".to_owned()
+        }
+    };
+    Some(not_configured(message, "no_providers_configured"))
+}
+
+fn not_configured(message: String, code: &str) -> RouterError {
+    let mut error = RouterError::invalid(message, "model");
+    code.clone_into(&mut error.body.code);
+    error
 }
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {

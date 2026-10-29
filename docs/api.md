@@ -109,6 +109,15 @@ because they can echo prompts or credentials. Transport failures are `502 upstre
 deadlines `504 upstream_timeout`. When every target of an alias failed, the last retryable error is
 returned, or `503 no_route_available` when no target could be tried (for example, every circuit is open).
 
+A router that has no provider for the request says what to set up instead, with `param` `model`:
+`400 no_providers_configured` when it has no providers at all, and, for a router started
+[without a configuration file](configuration.md#starting-without-a-configuration-file),
+`400 provider_not_configured` naming the key variable of a known provider it has not set up:
+
+```json
+{"error":{"message":"Provider groq is not set up on this router: set GROQ_API_KEY where the router runs, then restart it.","type":"invalid_request_error","param":"model","code":"provider_not_configured"}}
+```
+
 ## Model discovery
 
 `GET /v1/models` returns the configured aliases and models, plus every provider's own catalog of chat

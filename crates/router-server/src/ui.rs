@@ -7,7 +7,7 @@ use axum::{
     routing::{delete, get},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use router_core::{CircuitState, RouterError, WebUiConfig};
+use router_core::{CircuitState, ConfigSource, RouterError, STANDARD_PROVIDERS, WebUiConfig};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -205,6 +205,34 @@ async fn overview_handler(State(state): State<AppState>, headers: HeaderMap) -> 
             }))
         })
         .collect::<Vec<_>>();
+    // Discovery is cached for five minutes, so only the first load waits.
+    state.router.refresh_models().await;
+    let discovered_models = state
+        .router
+        .models(state.created)
+        .into_iter()
+        .filter(|model| {
+            !config.models.contains_key(&model.id) && !config.aliases.contains_key(&model.id)
+        })
+        .collect::<Vec<_>>();
+    let key_variables = STANDARD_PROVIDERS
+        .iter()
+        .map(|standard| {
+            json!({
+                "provider": standard.name,
+                "kind": standard.kind,
+                "variables": standard.key_variables,
+                "configured": config
+                    .providers
+                    .get(standard.name)
+                    .is_some_and(|provider| provider.kind == standard.kind),
+            })
+        })
+        .collect::<Vec<_>>();
+    let config_path = match &state.config_source {
+        Some(ConfigSource::File(path)) => Some(path.display().to_string()),
+        _ => None,
+    };
     let circuits = state
         .router
         .circuit_states()
@@ -222,8 +250,14 @@ async fn overview_handler(State(state): State<AppState>, headers: HeaderMap) -> 
         "status": "ready",
         "version": env!("CARGO_PKG_VERSION"),
         "started_at": state.created,
+        "config": {
+            "source": state.config_source.as_ref().map(ConfigSource::label),
+            "path": config_path,
+            "key_variables": key_variables,
+        },
         "providers": providers,
         "models": models,
+        "discovered_models": discovered_models,
         "aliases": config.aliases,
         "circuits": circuits,
         "security": {

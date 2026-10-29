@@ -22,9 +22,9 @@ layout, and the [build and run skill](.skills/haarness-router-build-run/SKILL.md
 loop and how to keep the build cache warm.
 
 ```bash
-cp config.example.toml config.toml
-export OPENAI_API_KEY='...' ANTHROPIC_API_KEY='...' GEMINI_API_KEY='...'   # every provider in the file
-cargo run --bin haarness-router -- --config config.toml
+export OPENAI_API_KEY='...' ANTHROPIC_API_KEY='...' GEMINI_API_KEY='...'   # any you have
+cargo run --bin haarness-router                                            # no file: the keys above
+cargo run --bin haarness-router -- --config config.example.toml           # or a configuration file
 ```
 
 ## Checks

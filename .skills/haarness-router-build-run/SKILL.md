@@ -17,7 +17,7 @@ cargo build --bin haarness-router
 target/debug/haarness-router --config config.example.toml --host 127.0.0.1 --port 8080
 ```
 
-Select the intended configuration; the example is a schema/example, not a promise that its referenced provider credentials exist. Check existing processes and choose an unused port. Preserve `.env`, credential sources and user configuration. A foreground instance can be stopped with Ctrl+C; for background work record and stop only the process started for that task. Reloading the browser does not replace the running server binary.
+Select the intended configuration; the example is a schema/example, not a promise that its referenced provider credentials exist. Without `--config` (or `HAARNESS_ROUTER_CONFIG`) and without a `config.toml` in the current folder, the binary starts from built-in defaults with one provider per standard key variable it finds (see [configuration](../../docs/configuration.md#starting-without-a-configuration-file)); an explicit missing file still fails. On a terminal it prints a startup summary and text logs; otherwise JSON (`--log-format` overrides). Check existing processes and choose an unused port. Preserve `.env`, credential sources and user configuration. A foreground instance can be stopped with Ctrl+C; for background work record and stop only the process started for that task. Reloading the browser does not replace the running server binary.
 
 For the existing Stackforward configuration and credentials, use the supported launcher with development compilation:
 

@@ -2,7 +2,10 @@
 
 Haarness Router assembles its configuration in layers:
 
-1. A TOML file supplies the readable baseline (`--config`, default `config.toml`, or `HAARNESS_ROUTER_CONFIG`).
+1. A TOML file supplies the readable baseline: the one named by `--config` or `HAARNESS_ROUTER_CONFIG`,
+   else `config.toml` in the current folder. With neither, the router
+   [starts from its built-in defaults](#starting-without-a-configuration-file) and the provider keys it
+   finds in the environment.
 2. Repeatable `--set TOML_PATH=VALUE` arguments apply typed overrides, in order.
 3. `--require-key` or `--no-auth`, if given, switch authentication on or off.
 4. Repeatable `--unset TOML_PATH` arguments remove values or whole sections.
@@ -17,6 +20,43 @@ providers and inconsistent settings all stop startup with a message naming the f
 Start from [`config.example.toml`](../config.example.toml) (OpenAI, Anthropic and Gemini with a `fast`
 alias) or [`config.all-providers.example.toml`](../config.all-providers.example.toml) (every OpenAI-compatible
 preset plus a local endpoint). [Providers](providers.md) shows Vertex AI and Bedrock.
+
+## Starting without a configuration file
+
+`haarness-router` with no `--config`, no `HAARNESS_ROUTER_CONFIG` and no `config.toml` in the current folder
+starts from the defaults in the [reference](#reference) below and sets up one provider for each of these
+variables that is set and not empty:
+
+| Variable | Provider | Kind |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | `openai` | `openai` (with `allow_unknown_fields`, as in the examples) |
+| `ANTHROPIC_API_KEY` | `anthropic` | `anthropic` |
+| `GEMINI_API_KEY`, else `GOOGLE_API_KEY` | `gemini` | `gemini` |
+| `GROQ_API_KEY` | `groq` | `groq` |
+| `MISTRAL_API_KEY` | `mistral` | `mistral` |
+| `XAI_API_KEY` | `xai` | `xai` |
+| `DEEPSEEK_API_KEY` | `deepseek` | `deepseek` |
+| `TOGETHER_API_KEY` | `together` | `together` |
+| `FIREWORKS_API_KEY` | `fireworks` | `fireworks` |
+| `AWS_BEARER_TOKEN_BEDROCK` | `bedrock` | `amazon-bedrock`, in the region of `AWS_REGION` or `AWS_DEFAULT_REGION` (default `us-east-1`) |
+
+No models or aliases are declared: `GET /v1/models` lists what each provider's live catalog offers, and any
+model is called as `provider/model`. The router listens on `127.0.0.1:8080` with the dashboard on and no
+router key, as a file with only `[providers]` would.
+
+With no key at all it still starts, so the dashboard can show what to set, and a chat request answers
+`400 no_providers_configured` with the list of variables. A request for a provider in the table whose
+variable is not set answers `400 provider_not_configured`, naming it. Set the variable and restart.
+
+`--set`, `--unset`, `--require-key`, `--no-auth` and the address flags apply on top, so a quick alias or a
+local endpoint needs no file:
+
+```bash
+haarness-router --set 'aliases.fast.targets=["openai/gpt-5-nano","gemini/gemini-3.5-flash-lite"]'
+haarness-router --require-key --host 0.0.0.0     # clients then need HAARNESS_ROUTER_KEY
+```
+
+A configuration named with `--config` or `HAARNESS_ROUTER_CONFIG` that cannot be read still stops startup.
 
 ## Configuration file
 
@@ -179,10 +219,18 @@ An empty table (`[models."openai/gpt-5-nano"]`) declares a model with its provid
 | --- | --- |
 | `targets` | Non-empty ordered list of `provider/model` targets. Alias names cannot contain `/`. |
 
-## Logs
+## Startup and logs
 
-Logs are JSON lines on standard output; `RUST_LOG` replaces the default `info,tower_http=warn` filter. See
+On a terminal the router starts with a short summary on standard error — its version, the API and dashboard
+addresses, the providers it set up (or the variables to set), where its configuration came from and the
+command that connects Haarness — and then logs readable text. When standard error is not a terminal
+(a service manager, a container, a pipe) it writes JSON lines instead, starting with a
+`haarness router listening` line. `--log-format text|json` or `HAARNESS_ROUTER_LOG_FORMAT` chooses either
+explicitly; `NO_COLOR` turns colour off. `RUST_LOG` replaces the default `info,tower_http=warn` filter. See
 [observability](observability.md#logs) for the fields and [security](security.md) for what is never logged.
+
+A port that is already taken stops startup with `port 8080 on 127.0.0.1 is already in use` and a `--port`
+to try instead.
 
 ## Secrets
 

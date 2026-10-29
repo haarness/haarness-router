@@ -14,10 +14,15 @@ binary with `include_str!`, so a UI change needs a Rust rebuild and a restart.
 
 ```bash
 cargo build --bin haarness-router                     # dev profile, incremental
+OPENAI_API_KEY=… target/debug/haarness-router         # no file: one provider per key set
 OPENAI_API_KEY=… ANTHROPIC_API_KEY=… GEMINI_API_KEY=… \
   target/debug/haarness-router --config config.example.toml --port 8080
 ```
 
+Without `--config` and without a `config.toml` in the current folder, the router
+[starts from the environment](configuration.md#starting-without-a-configuration-file); the repository root
+has no `config.toml`, so `cargo run --bin haarness-router` does that. On a terminal it prints a startup
+summary and readable logs; `--log-format json` shows what a service manager would get.
 `haarness-router --help` lists every flag. Three profiles are configured in `Cargo.toml`:
 
 | Profile | Use | Binary |
@@ -65,9 +70,18 @@ HAARNESS_ROUTER_PROFILE=dev ./scripts/run-stackforward    # dev build (also: deb
 ```
 
 Open the dashboard with the `.env` credentials, and `source .env` before running the client examples.
+To try the start without a configuration file, run the binary yourself with only the provider keys in its
+environment and no `config.toml` in its folder.
 Without the credential YAML the launcher stops; use the plain build-and-run steps above instead.
 `python3 scripts/test-launcher-profile.py` checks the launcher's profile selection and argument forwarding
 without credentials or compilation.
+
+## Windows
+
+`.cargo/config.toml` links the C runtime statically for the `x86_64-pc-windows-msvc` and
+`aarch64-pc-windows-msvc` targets, so `haarness-router.exe` starts on a machine without the Visual C++
+Redistributable. Cross-checking from macOS or Linux needs the MSVC headers, for example through
+`cargo xwin`, because the TLS stack compiles C code.
 
 ## Repository layout
 

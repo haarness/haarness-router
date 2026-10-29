@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{self, Read},
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -39,9 +39,28 @@ impl AppConfig {
     ) -> Result<Self, RouterError> {
         let path = path.as_ref();
         let source = read_config_source(path)?;
-        let mut document: toml::Value = toml::from_str(&source).map_err(|error| {
+        let document: toml::Value = toml::from_str(&source).map_err(|error| {
             RouterError::invalid(format!("invalid TOML configuration: {error}"), "config")
         })?;
+        Self::from_document(document, overrides, removals)
+    }
+
+    /// The configuration used when there is no file: built-in defaults and one
+    /// provider for each [standard key variable](STANDARD_PROVIDERS) that is
+    /// set, with `--set`/`--unset` applied on top as for a file.
+    pub fn from_environment(
+        overrides: &[String],
+        removals: &[String],
+    ) -> Result<Self, RouterError> {
+        let document = environment_document(|name| std::env::var(name).ok());
+        Self::from_document(document, overrides, removals)
+    }
+
+    fn from_document(
+        mut document: toml::Value,
+        overrides: &[String],
+        removals: &[String],
+    ) -> Result<Self, RouterError> {
         for expression in overrides {
             apply_override(&mut document, expression)?;
         }
@@ -144,6 +163,163 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+/// Where the running configuration came from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigSource {
+    /// A TOML file, by the path it was opened with.
+    File(PathBuf),
+    /// A TOML document read from standard input (`--config -`).
+    Stdin,
+    /// No file: built-in defaults plus the standard key variables found.
+    Environment,
+}
+
+impl ConfigSource {
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::File(_) => "file",
+            Self::Stdin => "stdin",
+            Self::Environment => "environment",
+        }
+    }
+}
+
+/// A provider the router sets up by itself, without a configuration file,
+/// when one of its key variables is set.
+#[derive(Clone, Copy, Debug)]
+pub struct StandardProvider {
+    /// The provider name, and so the prefix of its model IDs.
+    pub name: &'static str,
+    pub kind: ProviderKind,
+    /// The variables holding its key, in order of preference.
+    pub key_variables: &'static [&'static str],
+}
+
+impl StandardProvider {
+    /// The first of its key variables that `lookup` finds with a value.
+    pub fn key_variable(&self, lookup: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+        self.key_variables
+            .iter()
+            .copied()
+            .find(|name| lookup(name).is_some_and(|value| !value.is_empty()))
+    }
+
+    #[must_use]
+    pub fn named(name: &str) -> Option<&'static Self> {
+        STANDARD_PROVIDERS
+            .iter()
+            .find(|provider| provider.name == name)
+    }
+}
+
+/// The providers a router without a configuration file looks for, in the
+/// order it lists them.
+pub const STANDARD_PROVIDERS: &[StandardProvider] = &[
+    StandardProvider {
+        name: "openai",
+        kind: ProviderKind::Openai,
+        key_variables: &["OPENAI_API_KEY"],
+    },
+    StandardProvider {
+        name: "anthropic",
+        kind: ProviderKind::Anthropic,
+        key_variables: &["ANTHROPIC_API_KEY"],
+    },
+    StandardProvider {
+        name: "gemini",
+        kind: ProviderKind::Gemini,
+        key_variables: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    },
+    StandardProvider {
+        name: "groq",
+        kind: ProviderKind::Groq,
+        key_variables: &["GROQ_API_KEY"],
+    },
+    StandardProvider {
+        name: "mistral",
+        kind: ProviderKind::Mistral,
+        key_variables: &["MISTRAL_API_KEY"],
+    },
+    StandardProvider {
+        name: "xai",
+        kind: ProviderKind::Xai,
+        key_variables: &["XAI_API_KEY"],
+    },
+    StandardProvider {
+        name: "deepseek",
+        kind: ProviderKind::Deepseek,
+        key_variables: &["DEEPSEEK_API_KEY"],
+    },
+    StandardProvider {
+        name: "together",
+        kind: ProviderKind::Together,
+        key_variables: &["TOGETHER_API_KEY"],
+    },
+    StandardProvider {
+        name: "fireworks",
+        kind: ProviderKind::Fireworks,
+        key_variables: &["FIREWORKS_API_KEY"],
+    },
+    StandardProvider {
+        name: "bedrock",
+        kind: ProviderKind::AmazonBedrock,
+        key_variables: &["AWS_BEARER_TOKEN_BEDROCK"],
+    },
+];
+
+/// The configuration document for a router without a file. Only variable
+/// names go into it; the router reads the values once, as for a file.
+fn environment_document(lookup: impl Fn(&str) -> Option<String>) -> toml::Value {
+    let mut providers = toml::Table::new();
+    for provider in STANDARD_PROVIDERS {
+        let Some(variable) = provider.key_variable(&lookup) else {
+            continue;
+        };
+        let kind = toml::Value::try_from(provider.kind).expect("provider kinds serialize");
+        let mut table = toml::Table::new();
+        table.insert("kind".into(), kind);
+        table.insert("api_key_env".into(), variable.into());
+        match provider.kind {
+            // As in the example configurations: OpenAI's own SDK fields pass through.
+            ProviderKind::Openai => {
+                table.insert("allow_unknown_fields".into(), true.into());
+            }
+            ProviderKind::AmazonBedrock => {
+                if let Some(base_url) = bedrock_region_url(&lookup) {
+                    table.insert("base_url".into(), base_url.into());
+                }
+            }
+            _ => {}
+        }
+        providers.insert(provider.name.into(), toml::Value::Table(table));
+    }
+    let mut document = toml::Table::new();
+    document.insert("providers".into(), toml::Value::Table(providers));
+    toml::Value::Table(document)
+}
+
+/// Bedrock's runtime endpoint for the region the AWS tools would use, when
+/// one is set and looks like a region name.
+fn bedrock_region_url(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let region = ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .into_iter()
+        .find_map(|name| lookup(name).filter(|value| !value.is_empty()))?;
+    let valid = region.len() <= 32
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if !valid {
+        return None;
+    }
+    let domain = if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    };
+    Some(format!("https://bedrock-runtime.{region}.{domain}"))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -659,13 +835,139 @@ const fn default_runtime_key_limit() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
-        ProviderKind, ProviderProtocol, WebUiConfig, apply_override, remove_override, split_target,
+        AppConfig, ProviderKind, ProviderProtocol, STANDARD_PROVIDERS, StandardProvider,
+        WebUiConfig, apply_override, environment_document, remove_override, split_target,
     };
+
+    fn lookup(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let values: HashMap<String, String> = values
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        move |name| values.get(name).cloned()
+    }
+
+    fn environment_config(values: &[(&str, &str)]) -> AppConfig {
+        environment_document(lookup(values)).try_into().unwrap()
+    }
+
+    #[test]
+    fn environment_defaults_add_one_provider_per_key_found() {
+        let config = environment_config(&[
+            ("OPENAI_API_KEY", "x"),
+            ("ANTHROPIC_API_KEY", "x"),
+            ("GOOGLE_API_KEY", "x"),
+            ("GROQ_API_KEY", ""),
+            ("AWS_BEARER_TOKEN_BEDROCK", "x"),
+            ("AWS_REGION", "eu-west-3"),
+        ]);
+        assert_eq!(
+            config.providers.keys().collect::<Vec<_>>(),
+            ["anthropic", "bedrock", "gemini", "openai"]
+        );
+        let openai = &config.providers["openai"];
+        assert_eq!(openai.kind, ProviderKind::Openai);
+        assert_eq!(openai.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert!(openai.allow_unknown_fields);
+        // An empty variable counts as unset; Google's name is Gemini's fallback.
+        assert_eq!(
+            config.providers["gemini"].api_key_env.as_deref(),
+            Some("GOOGLE_API_KEY")
+        );
+        let bedrock = &config.providers["bedrock"];
+        assert_eq!(bedrock.kind, ProviderKind::AmazonBedrock);
+        assert_eq!(
+            bedrock.base_url.as_deref(),
+            Some("https://bedrock-runtime.eu-west-3.amazonaws.com")
+        );
+        assert!(config.models.is_empty() && config.aliases.is_empty());
+        assert_eq!(config.server.bind.to_string(), "127.0.0.1:8080");
+        assert!(config.web_ui.enabled && !config.auth.requires_key());
+    }
+
+    #[test]
+    fn environment_defaults_prefer_gemini_key_and_check_the_region() {
+        let config = environment_config(&[
+            ("GEMINI_API_KEY", "x"),
+            ("GOOGLE_API_KEY", "x"),
+            ("AWS_BEARER_TOKEN_BEDROCK", "x"),
+            ("AWS_REGION", "us-east-1.evil.example/"),
+            ("AWS_DEFAULT_REGION", "cn-north-1"),
+        ]);
+        assert_eq!(
+            config.providers["gemini"].api_key_env.as_deref(),
+            Some("GEMINI_API_KEY")
+        );
+        // A value that is not a region name keeps Bedrock's default endpoint.
+        assert_eq!(config.providers["bedrock"].base_url, None);
+
+        let china = environment_config(&[
+            ("AWS_BEARER_TOKEN_BEDROCK", "x"),
+            ("AWS_DEFAULT_REGION", "cn-north-1"),
+        ]);
+        assert_eq!(
+            china.providers["bedrock"].base_url.as_deref(),
+            Some("https://bedrock-runtime.cn-north-1.amazonaws.com.cn")
+        );
+    }
+
+    #[test]
+    fn environment_defaults_start_without_any_key() {
+        let config = environment_config(&[]);
+        assert!(config.providers.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn overrides_apply_on_top_of_environment_defaults() {
+        let config = AppConfig::from_document(
+            environment_document(lookup(&[("ANTHROPIC_API_KEY", "x")])),
+            &[
+                "server.bind=127.0.0.1:9191".into(),
+                "providers.local.kind=openai-compatible".into(),
+                "providers.local.base_url=https://models.example/v1".into(),
+            ],
+            &["providers.anthropic".into()],
+        )
+        .unwrap();
+        assert_eq!(config.server.bind.to_string(), "127.0.0.1:9191");
+        assert_eq!(config.providers.keys().collect::<Vec<_>>(), ["local"]);
+        // As for a file, removing what is not there is an error.
+        let missing = AppConfig::from_document(
+            environment_document(lookup(&[])),
+            &[],
+            &["providers.openai".into()],
+        );
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn standard_providers_have_unique_names_and_valid_defaults() {
+        for (index, provider) in STANDARD_PROVIDERS.iter().enumerate() {
+            assert!(!provider.key_variables.is_empty(), "{}", provider.name);
+            assert!(
+                provider.kind.default_base_url().is_some(),
+                "{}",
+                provider.name
+            );
+            assert!(
+                STANDARD_PROVIDERS[index + 1..]
+                    .iter()
+                    .all(|other| other.name != provider.name)
+            );
+            assert_eq!(
+                StandardProvider::named(provider.name).map(|found| found.kind),
+                Some(provider.kind)
+            );
+        }
+        assert!(StandardProvider::named("local").is_none());
+    }
 
     #[test]
     fn auth_is_optional_but_existing_key_lists_stay_protected() {
-        use super::AppConfig;
         for auth in [
             serde_json::json!({}),
             serde_json::json!({"enabled":false,"router_key_envs":["HAARNESS_MISSING_UNUSED_ROUTER_KEY"]}),
@@ -697,7 +999,6 @@ mod tests {
 
     #[test]
     fn metrics_token_reference_is_checked_only_when_auth_is_on() {
-        use super::AppConfig;
         let config = |enabled: bool| -> AppConfig {
             // PATH stands in for a present router key; only presence is checked.
             serde_json::from_value(serde_json::json!({
