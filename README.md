@@ -26,7 +26,7 @@ user database, provider marketplace or prompt storage** — it routes, and that 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/assets/web-ui-dark.png">
-    <img alt="The Haarness Router dashboard: provider health, models, fallback aliases, circuit health and live router activity" src=".github/assets/web-ui-light.png" width="100%">
+    <img alt="The Haarness Router dashboard: the endpoint, each provider's key and circuit state, live activity and the commands to connect a client" src=".github/assets/web-ui-light.png" width="100%">
   </picture>
 </p>
 
