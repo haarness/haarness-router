@@ -753,6 +753,7 @@ dependencies = [
  "router-protocol",
  "router-providers",
  "router-server",
+ "rustls-native-certs",
  "secrecy",
  "serde",
  "serde_json",

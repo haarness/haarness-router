@@ -127,6 +127,9 @@ async fn main() -> Result<()> {
     let bind = config.server.bind;
     let drain = Duration::from_secs(config.server.drain_seconds);
     let auth = AuthStore::from_config(&config).map_err(anyhow::Error::new)?;
+    if !config.providers.is_empty() {
+        require_system_certificates()?;
+    }
     let adapters = router_providers::build_adapters(&config).map_err(anyhow::Error::new)?;
     let summary = Summary::new(&config, &source, auth.authentication_required());
     let router = Router::new(config, adapters).map_err(anyhow::Error::new)?;
@@ -223,6 +226,27 @@ fn config_source(explicit: Option<&Path>, default_file_exists: bool) -> ConfigSo
         None if default_file_exists => ConfigSource::File(PathBuf::from(DEFAULT_CONFIG_FILE)),
         None => ConfigSource::Environment,
     }
+}
+
+/// Linux keeps its trusted roots in a package (ca-certificates) that minimal systems and container images leave
+/// out. The HTTPS client providers need then fails to build, which used to stop the router with a bare "builder
+/// error" before it listened.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn require_system_certificates() -> Result<()> {
+    if rustls_native_certs::load_native_certs().certs.is_empty() {
+        anyhow::bail!(
+            "No trusted CA certificates were found on this system, so the router cannot reach providers over HTTPS. \
+             Install your distribution's ca-certificates package (for example `sudo apt install ca-certificates`), \
+             or point SSL_CERT_FILE at a certificate bundle, then start it again."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(all(unix, not(target_vendor = "apple"))))]
+#[allow(clippy::unnecessary_wraps)]
+fn require_system_certificates() -> Result<()> {
+    Ok(())
 }
 
 fn effective_bind(configured: SocketAddr, args: &Args) -> SocketAddr {
