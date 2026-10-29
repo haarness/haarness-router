@@ -14,10 +14,10 @@ clap.workspace = true
 futures.workspace = true
 png.workspace = true
 reqwest.workspace = true
-router-core = { version = "0.1.11", path = "../router-core" }
-router-providers = { version = "0.1.11", path = "../router-providers" }
-router-protocol = { version = "0.1.11", path = "../router-protocol" }
-router-server = { version = "0.1.11", path = "../router-server" }
+router-core = { version = "0.1.12", path = "../router-core" }
+router-providers = { version = "0.1.12", path = "../router-providers" }
+router-protocol = { version = "0.1.12", path = "../router-protocol" }
+router-server = { version = "0.1.12", path = "../router-server" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
