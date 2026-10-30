@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "haarness-router"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "router-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1587,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "router-protocol"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "serde",
  "serde_json",
@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "router-providers"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1619,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "router-server"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-stream",
  "axum",

@@ -13,8 +13,8 @@ bytes.workspace = true
 futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-router-core = { version = "0.1.13", path = "../router-core" }
-router-protocol = { version = "0.1.13", path = "../router-protocol" }
+router-core = { version = "0.1.14", path = "../router-core" }
+router-protocol = { version = "0.1.14", path = "../router-protocol" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,7 +28,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
-router-providers = { version = "0.1.13", path = "../router-providers" }
+router-providers = { version = "0.1.14", path = "../router-providers" }
 tower.workspace = true
 tracing-subscriber.workspace = true
 

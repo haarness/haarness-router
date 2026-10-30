@@ -11,7 +11,7 @@ async-trait.workspace = true
 dashmap.workspace = true
 futures.workspace = true
 http.workspace = true
-router-protocol = { version = "0.1.13", path = "../router-protocol" }
+router-protocol = { version = "0.1.14", path = "../router-protocol" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
