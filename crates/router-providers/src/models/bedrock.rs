@@ -94,6 +94,9 @@ fn model(id: &str, name: &str) -> ModelObject {
     }
 }
 
+/// Inference profiles, page by page. A page that fails or a listing longer
+/// than ten pages ends the read with what came before it rather than
+/// dropping every profile; only a first page that fails reads as nothing.
 async fn profiles(
     client: &reqwest::Client,
     base: &url::Url,
@@ -101,26 +104,31 @@ async fn profiles(
 ) -> Option<Vec<Value>> {
     let mut cursor = None::<String>;
     let mut results = Vec::new();
-    for _ in 0..10 {
+    for page in 0..10 {
         let mut url = base.join("inference-profiles").ok()?;
         url.query_pairs_mut().append_pair("maxResults", "100");
         if let Some(cursor) = &cursor {
             url.query_pairs_mut().append_pair("nextToken", cursor);
         }
-        let body = super::read_json(client.get(url).bearer_auth(key.expose_secret())).await?;
-        results.extend(
-            body["inferenceProfileSummaries"]
-                .as_array()?
-                .iter()
-                .cloned(),
-        );
-        let Some(next) = body["nextToken"].as_str().filter(|v| !v.is_empty()) else {
+        let body = super::read_json(client.get(url).bearer_auth(key.expose_secret())).await;
+        let Some(rows) = body
+            .as_ref()
+            .and_then(|body| body["inferenceProfileSummaries"].as_array())
+        else {
+            return (page > 0).then_some(results);
+        };
+        results.extend(rows.iter().cloned());
+        let Some(next) = body
+            .as_ref()
+            .and_then(|body| body["nextToken"].as_str())
+            .filter(|v| !v.is_empty())
+        else {
             return Some(results);
         };
         if cursor.as_deref() == Some(next) {
-            return None;
+            return Some(results);
         }
         cursor = Some(next.into());
     }
-    None
+    Some(results)
 }

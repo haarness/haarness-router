@@ -223,6 +223,61 @@ async fn xai_discovers_its_chat_models_from_language_models() {
 }
 
 #[tokio::test]
+async fn bedrock_keeps_the_profiles_it_read_past_the_page_limit() {
+    let (url, requests, task) = fixture(|path| {
+        if path.starts_with("/foundation-models?") {
+            return (200, foundation());
+        }
+        // Every page names a next one, as a very long listing would.
+        let page = path.rsplit('=').next().unwrap_or_default().to_owned();
+        (
+            200,
+            json!({"inferenceProfileSummaries":[profile(&format!("profile-{page}"),"anthropic.claude-test-v1:0")],"nextToken":format!("{page}x")}),
+        )
+    })
+    .await;
+    let config = serde_json::from_value(
+        json!({"kind":"amazon-bedrock","base_url":url,"allow_insecure_http":true}),
+    )
+    .unwrap();
+    let models = from_adapter(config).await.unwrap();
+    task.abort();
+    assert_eq!(requests.lock().unwrap().len(), 11);
+    // The foundation model and the ten profiles read.
+    assert_eq!(models.len(), 11);
+}
+
+#[tokio::test]
+async fn bedrock_keeps_earlier_profile_pages_when_a_later_one_fails() {
+    let (url, _, task) = fixture(|path| {
+        if path.starts_with("/foundation-models?") {
+            (200, foundation())
+        } else if path == "/inference-profiles?maxResults=100" {
+            (
+                200,
+                json!({"inferenceProfileSummaries":[profile("us.anthropic.claude-test-v1:0","anthropic.claude-test-v1:0")],"nextToken":"two"}),
+            )
+        } else {
+            (500, json!({}))
+        }
+    })
+    .await;
+    let config = serde_json::from_value(
+        json!({"kind":"amazon-bedrock","base_url":url,"allow_insecure_http":true}),
+    )
+    .unwrap();
+    let models = from_adapter(config).await.unwrap();
+    task.abort();
+    assert_eq!(
+        models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        [
+            "anthropic.claude-test-v1:0",
+            "us.anthropic.claude-test-v1:0"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn gemini_lists_a_new_generation_and_drops_what_cannot_chat() {
     let (url, _, task) = fixture(|path| {
         if path.starts_with("/models?") {
