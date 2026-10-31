@@ -106,6 +106,20 @@ impl Capabilities {
                 pdf_text_extraction: true,
                 ..Self::default()
             },
+            // Grok thinks at chosen levels (`reasoning_effort`) or at a fixed
+            // depth, reads images, calls tools in parallel and answers to a
+            // JSON schema; its reasoning text is not opaque.
+            CapabilityProfile::Xai => Self {
+                text: true,
+                streaming: true,
+                images: true,
+                function_tools: true,
+                parallel_tools: true,
+                structured_outputs: true,
+                reasoning: true,
+                pdf_text_extraction: true,
+                ..Self::default()
+            },
             CapabilityProfile::ConservativeOpenAiCompatible => Self {
                 text: true,
                 streaming: true,
