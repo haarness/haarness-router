@@ -155,16 +155,23 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                     if let Some(text) = delta.get("content").and_then(Value::as_str) {
                         yield ProviderEvent::TextDelta { index, text: text.into() };
                     }
-                    if let Some(text) = delta
+                    let text = delta
                         .get("reasoning")
                         .or_else(|| delta.get("reasoning_content"))
-                        .and_then(Value::as_str)
-                    {
-                        yield ProviderEvent::ReasoningDelta { index, text: text.into() };
-                    }
-                    if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
-                        for detail in details {
-                            yield ProviderEvent::ReasoningDetail { index, detail: detail.clone() };
+                        .and_then(Value::as_str);
+                    let details = delta.get("reasoning_details").and_then(Value::as_array);
+                    match (text, details) {
+                        // One chunk with both: the details carry the same text, so they travel together.
+                        (Some(text), Some(details)) if !details.is_empty() => {
+                            yield ProviderEvent::Reasoning { index, text: text.into(), details: details.clone() };
+                        }
+                        (text, details) => {
+                            if let Some(text) = text {
+                                yield ProviderEvent::ReasoningDelta { index, text: text.into() };
+                            }
+                            for detail in details.into_iter().flatten() {
+                                yield ProviderEvent::ReasoningDetail { index, detail: detail.clone() };
+                            }
                         }
                     }
                     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {

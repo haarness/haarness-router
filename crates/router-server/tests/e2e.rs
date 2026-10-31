@@ -1767,3 +1767,96 @@ async fn a_file_configuration_keeps_unknown_providers_and_reports_its_path() {
             .contains("unknown provider openai")
     );
 }
+
+/// An aggregator that streams reasoning as text and as the details carrying the same text, in one chunk.
+async fn reasoning_twice_over() -> Response {
+    let sse = concat!(
+        "data: {\"id\":\"up\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning\":\"Thinking it over\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"Thinking it over\",\"index\":0}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"up\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(sse))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn reasoning_that_arrives_with_its_details_reaches_clients_once() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            AxumRouter::new().route("/chat/completions", post(reasoning_twice_over)),
+        )
+        .await
+        .unwrap();
+    });
+    let mut config = config(BTreeMap::from([(
+        "mock".into(),
+        provider(format!("http://{address}")),
+    )]));
+    config.auth = AuthConfig::default();
+    config
+        .models
+        .insert("mock/test".into(), ModelConfig::default());
+    let auth = AuthStore::from_config(&config).unwrap();
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(
+        config,
+        adapters,
+        HashMap::from([("mock".into(), SecretString::from("provider-secret"))]),
+    )
+    .unwrap();
+    let app = router_server::app(router_server::AppState::new(router, auth));
+    let ask = |stream: bool| {
+        let mut request = json_chat_request(
+            serde_json::json!({"model":"mock/test","messages":[{"role":"user","content":"hi"}],"stream":stream}),
+        );
+        request.headers_mut().remove(header::AUTHORIZATION);
+        request.headers_mut().remove("x-upstream-api-key");
+        request
+    };
+    // Streamed: one chunk holds the text and its details together.
+    let body = to_bytes(
+        app.clone().oneshot(ask(true)).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    let chunks: Vec<serde_json::Value> = String::from_utf8_lossy(&body)
+        .split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect();
+    let reasoning: Vec<&serde_json::Value> = chunks
+        .iter()
+        .map(|chunk| &chunk["choices"][0]["delta"])
+        .filter(|delta| {
+            delta.get("reasoning").is_some() || delta.get("reasoning_details").is_some()
+        })
+        .collect();
+    assert_eq!(reasoning.len(), 1, "{chunks:?}");
+    assert_eq!(reasoning[0]["reasoning"], "Thinking it over");
+    assert_eq!(
+        reasoning[0]["reasoning_details"][0]["text"],
+        "Thinking it over"
+    );
+    // Whole: the text once, and the detail for replay.
+    let body = to_bytes(
+        app.oneshot(ask(false)).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    let whole: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let message = &whole["choices"][0]["message"];
+    assert_eq!(message["reasoning"], "Thinking it over", "{whole}");
+    assert_eq!(
+        message["reasoning_details"][0]["text"], "Thinking it over",
+        "{whole}"
+    );
+}
