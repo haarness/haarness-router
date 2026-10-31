@@ -193,3 +193,31 @@ async fn repeated_page_token_terminates_discovery() {
     task.abort();
     assert_eq!(requests.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn xai_discovers_its_chat_models_from_language_models() {
+    let (url, requests, task) = fixture(|path| {
+        if path == "/v1/language-models" {
+            (
+                200,
+                json!({"models":[
+                    {"id":"grok-4.7","input_modalities":["text","image"],"capabilities":{"reasoning_effort":["low","high"]}},
+                    {"id":"grok-4.20-multi-agent-0309","input_modalities":["text","image"]}
+                ]}),
+            )
+        } else {
+            (404, json!({}))
+        }
+    })
+    .await;
+    let config = serde_json::from_value(
+        json!({"kind":"xai","base_url":format!("{url}/v1"),"allow_insecure_http":true}),
+    )
+    .unwrap();
+    let models = from_adapter(config).await.unwrap();
+    task.abort();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "grok-4.7");
+    assert_eq!(models[0].metadata["supports_vision"], json!(true));
+    assert!(requests.lock().unwrap()[0].starts_with("GET /v1/language-models "));
+}

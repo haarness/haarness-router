@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use futures::StreamExt;
-use router_core::{ProviderConfig, ProviderProtocol};
+use router_core::{ProviderConfig, ProviderKind, ProviderProtocol};
 use router_protocol::ModelObject;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
@@ -27,12 +27,17 @@ pub(crate) async fn discover(
         return bedrock::discover(&client, config, key).await;
     }
     let vertex = vertex_catalog_url(config);
+    // xAI's `/models` mixes its image and video generators in with its chat
+    // models and says nothing of their input; `/language-models` lists only
+    // the chat models, with their input and reasoning levels.
+    let xai = config.kind == ProviderKind::Xai;
     let base = if let Some(url) = &vertex {
         url.to_string()
     } else {
         format!(
-            "{}/models",
-            config.effective_base_url().ok()?.trim_end_matches('/')
+            "{}/{}",
+            config.effective_base_url().ok()?.trim_end_matches('/'),
+            if xai { "language-models" } else { "models" }
         )
     };
     let mut cursor = None::<String>;
@@ -89,7 +94,7 @@ pub(crate) async fn discover(
         let body = read_json(request).await?;
         let rows = body[if vertex.is_some() {
             "publisherModels"
-        } else if protocol == ProviderProtocol::GeminiGenerateContent {
+        } else if protocol == ProviderProtocol::GeminiGenerateContent || xai {
             "models"
         } else {
             "data"
@@ -301,6 +306,32 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
                 .entry("reasoning_efforts".into())
                 .or_insert_with(|| json!(gemini_reasoning_efforts(id)));
         }
+    } else if config.kind == ProviderKind::Xai {
+        // Its multi-agent models answer only on the Responses API.
+        if id.contains("multi-agent") {
+            return None;
+        }
+        if let Some(inputs) = entry["input_modalities"].as_array() {
+            metadata.insert(
+                "supports_vision".into(),
+                json!(inputs.iter().any(|input| input == "image")),
+            );
+        }
+        let efforts = entry
+            .pointer("/capabilities/reasoning_effort")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // A model that reasons at a fixed depth says so in its id only.
+        let fixed = id.ends_with("-reasoning") && !id.ends_with("-non-reasoning");
+        metadata
+            .entry("supports_reasoning".into())
+            .or_insert(json!(fixed || !efforts.is_empty()));
+        metadata
+            .entry("reasoning_efforts".into())
+            .or_insert(json!(efforts));
+        copy(entry, "context_length", &mut metadata, "context_window");
+        metadata.insert("supports_tools".into(), json!(true));
     } else if config.kind.is_native_openai() {
         let efforts = openai_reasoning_efforts(id);
         let supports_reasoning = metadata
@@ -592,6 +623,51 @@ mod tests {
             );
         }
         assert!(model_entry(&config, &json!({"name":"models/gemini-embedding-2","supportedGenerationMethods":["embedContent"]})).is_none());
+    }
+
+    #[test]
+    fn xai_models_say_their_input_and_reasoning_and_multi_agent_stays_out() {
+        let config = ProviderConfig {
+            kind: ProviderKind::Xai,
+            base_url: None,
+            api_key_env: None,
+            auth_header: None,
+            auth_scheme: None,
+            capabilities: None,
+            allow_unknown_fields: false,
+            allow_insecure_http: false,
+            connect_timeout_ms: 5_000,
+            stream_idle_timeout_ms: 60_000,
+            max_error_body_bytes: 4_096,
+        };
+        // Entries as xAI's `/language-models` lists them.
+        let leveled = model_entry(&config, &json!({"id": "grok-4.3", "input_modalities": ["text", "image"],
+            "context_length": 1_000_000,
+            "capabilities": {"reasoning_effort": ["none", "low", "medium", "high", "xhigh"], "default_reasoning_effort": "low"}}))
+        .unwrap();
+        assert_eq!(leveled.metadata["supports_vision"], json!(true));
+        assert_eq!(leveled.metadata["supports_reasoning"], json!(true));
+        assert_eq!(
+            leveled.metadata["reasoning_efforts"],
+            json!(["none", "low", "medium", "high", "xhigh"])
+        );
+        assert_eq!(leveled.metadata["context_window"], json!(1_000_000));
+        assert_eq!(leveled.metadata["supports_tools"], json!(true));
+        let fixed = model_entry(
+            &config,
+            &json!({"id": "grok-4.20-0309-reasoning", "input_modalities": ["text", "image"]}),
+        )
+        .unwrap();
+        assert_eq!(fixed.metadata["supports_reasoning"], json!(true));
+        assert_eq!(fixed.metadata["reasoning_efforts"], json!([]));
+        let plain = model_entry(
+            &config,
+            &json!({"id": "grok-4.20-0309-non-reasoning", "input_modalities": ["text"]}),
+        )
+        .unwrap();
+        assert_eq!(plain.metadata["supports_reasoning"], json!(false));
+        assert_eq!(plain.metadata["supports_vision"], json!(false));
+        assert!(model_entry(&config, &json!({"id": "grok-4.20-multi-agent-0309"})).is_none());
     }
 
     #[test]

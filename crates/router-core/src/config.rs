@@ -508,6 +508,7 @@ pub(crate) enum CapabilityProfile {
     Anthropic,
     Gemini,
     DeepSeek,
+    Xai,
     ConservativeOpenAiCompatible,
 }
 
@@ -548,7 +549,7 @@ impl ProviderKind {
             },
             Self::Xai => ProviderDescriptor {
                 protocol: ProviderProtocol::OpenAiChatCompletions,
-                capability_profile: CapabilityProfile::ConservativeOpenAiCompatible,
+                capability_profile: CapabilityProfile::Xai,
                 default_base_url: Some("https://api.x.ai/v1"),
             },
             Self::Deepseek => ProviderDescriptor {
@@ -900,6 +901,15 @@ mod tests {
         let config = environment_config(&[("DEEPSEEK_API_KEY", "x")]);
         let capabilities = config.providers["deepseek"].effective_capabilities();
         assert!(capabilities.reasoning && capabilities.images && capabilities.function_tools);
+        assert!(!capabilities.opaque_reasoning);
+    }
+
+    #[test]
+    fn xai_thinks_reads_images_and_answers_to_a_schema() {
+        let config = environment_config(&[("XAI_API_KEY", "x")]);
+        let capabilities = config.providers["xai"].effective_capabilities();
+        assert!(capabilities.reasoning && capabilities.images && capabilities.function_tools);
+        assert!(capabilities.parallel_tools && capabilities.structured_outputs);
         assert!(!capabilities.opaque_reasoning);
     }
 

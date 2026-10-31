@@ -24,6 +24,13 @@ endpoints receive `Authorization: Bearer <key>` unless `auth_header` names anoth
 `x-api-key`, sent with the raw key, or with an `auth_scheme` prefix). `X-Upstream-API-Key` is always consumed
 by the router and never forwarded under that name.
 
+### xAI
+
+`xai` lists models from xAI's `/language-models`, which names only its chat models and the input each takes;
+the image and video generators in `/models` stay out, and so do the multi-agent models, which xAI serves only
+on its Responses API. Each listed model says whether it reads images, whether it reasons and at which
+`reasoning_effort` levels. A model that reasons at a fixed depth (an id ending in `-reasoning`) lists no levels.
+
 ### Vertex AI
 
 Use `kind = "gemini"` with a Vertex AI publisher URL and `auth_header = "authorization"`, which sends the
