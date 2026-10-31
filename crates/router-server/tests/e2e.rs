@@ -498,6 +498,60 @@ async fn native_anthropic_contract_is_isolated_behind_canonical_events() {
 }
 
 #[tokio::test]
+async fn a_refused_forced_tool_call_is_asked_once_more_unforced() {
+    async fn refuses_forcing(
+        State(state): State<NativeMockState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        if matches!(body["tool_choice"]["type"].as_str(), Some("tool" | "any")) {
+            state.bodies.lock().unwrap().push(body);
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"type":"error","error":{"type":"invalid_request_error"}}"#,
+                ))
+                .unwrap();
+        }
+        mock_anthropic(State(state), headers, Json(body)).await
+    }
+    let state = NativeMockState::default();
+    let application = AxumRouter::new()
+        .route("/messages", post(refuses_forcing))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, application).await.unwrap() });
+    let config = config(BTreeMap::from([(
+        "anthropic".into(),
+        native_provider(ProviderKind::Anthropic, format!("http://{address}")),
+    )]));
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(config, adapters, HashMap::new()).unwrap();
+    let app = router_server::app(router_server::AppState::new(
+        router,
+        AuthStore::from_keys(["router-secret"], true),
+    ));
+    // A model the rules expect to take a forced call.
+    let response = app
+        .oneshot(json_chat_request(serde_json::json!({
+            "model": "anthropic/claude-haiku-7",
+            "messages": [{"role":"user", "content":"weather"}],
+            "tools": [{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}],
+            "tool_choice": {"type":"function","function":{"name":"weather"}},
+            "max_completion_tokens": 32
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bodies = state.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["tool_choice"]["type"], "tool");
+    assert_eq!(bodies[1]["tool_choice"], serde_json::json!({"type":"auto"}));
+}
+
+#[tokio::test]
 async fn native_gemini_contract_is_isolated_behind_canonical_events() {
     let (base_url, upstream) = spawn_native_mock(ProviderKind::Gemini).await;
     let config = config(BTreeMap::from([(

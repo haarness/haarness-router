@@ -80,7 +80,25 @@ impl ProviderAdapter for AnthropicAdapter {
         if body.pointer("/thinking/block_binding").is_some() {
             builder = builder.header("anthropic-beta", THINKING_BINDING_BETA);
         }
-        let response = builder.json(&body).send().await.map_err(request_error)?;
+        let retry = forces_tool(&body).then(|| builder.try_clone()).flatten();
+        let mut response = builder.json(&body).send().await.map_err(request_error)?;
+        // A model these rules do not know to refuse a forced tool call may
+        // still answer 400 to it, as thinking does with any model. The refusal
+        // costs nothing; ask once more and let the model choose the tool.
+        if response.status() == http::StatusCode::BAD_REQUEST
+            && let Some(builder) = retry
+        {
+            let mut unforced = body.clone();
+            unforced["tool_choice"]["type"] = json!("auto");
+            if let Some(choice) = unforced["tool_choice"].as_object_mut() {
+                choice.remove("name");
+            }
+            response = builder
+                .json(&unforced)
+                .send()
+                .await
+                .map_err(request_error)?;
+        }
         let response = self.transport.checked(response).await?;
         let upstream_request_id = upstream_request_id(response.headers());
         let mut source = self.transport.sse(response, cancel);
@@ -388,30 +406,47 @@ fn accepts_sampling(model: &str) -> bool {
 
 const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
-/// Models whose thinking blocks stay valid only while everything before them is
-/// unchanged (Anthropic's preserved-thinking page, 2026-10-10).
-fn prefix_bound_thinking(model: &str) -> bool {
-    [
-        "claude-fable-5-1",
-        "claude-opus-5-5",
-        "claude-sonnet-5-5",
-        "claude-haiku-5-5",
-    ]
-    .iter()
-    .any(|prefix| model.starts_with(prefix))
+/// A Claude id's family and `(major, minor)` generation: `("opus", (5, 5))`
+/// for `claude-opus-5-5`, `("sonnet", (3, 5))` for `claude-3-5-sonnet-20241022`.
+fn claude_model(model: &str) -> Option<(String, (u64, u64))> {
+    let lower = model.to_ascii_lowercase();
+    let mut parts = lower.split(['-', '.']);
+    parts.find(|part| part.ends_with("claude"))?;
+    let family = parts
+        .find(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphabetic()))
+        .unwrap_or_default()
+        .to_owned();
+    let generation = claude_generation(model);
+    let major = *generation.first()?;
+    Some((family, (major, generation.get(1).copied().unwrap_or(0))))
 }
 
-/// Models that answer 400 to `tool_choice` `any` or `tool` (checked 2026-10-10;
-/// Sonnet 5 and Haiku 5.5 still accept them).
+/// Models whose thinking blocks stay valid only while everything before them is
+/// unchanged (Anthropic's preserved-thinking page, 2026-10-10): Fable from 5.1
+/// and every family from 5.5. A newer generation is taken to do the same.
+fn prefix_bound_thinking(model: &str) -> bool {
+    claude_model(model).is_some_and(|(family, version)| {
+        version >= (5, 5) || (family == "fable" && version >= (5, 1))
+    })
+}
+
+/// Models that answer 400 to `tool_choice` `any` or `tool` (checked 2026-10-10):
+/// Fable and Mythos from 5.1, Opus and Sonnet from 5.5; Sonnet 5 and every
+/// Haiku so far accept them. A new family follows the newest flagships.
 fn rejects_forced_tool_choice(model: &str) -> bool {
-    [
-        "claude-fable-5-1",
-        "claude-mythos-5-1",
-        "claude-opus-5-5",
-        "claude-sonnet-5-5",
-    ]
-    .iter()
-    .any(|prefix| model.starts_with(prefix))
+    claude_model(model).is_some_and(|(family, version)| match family.as_str() {
+        "haiku" => false,
+        "fable" | "mythos" => version >= (5, 1),
+        _ => version >= (5, 5),
+    })
+}
+
+/// Whether the body forces a tool call, which a model may refuse.
+fn forces_tool(body: &Value) -> bool {
+    matches!(
+        body.pointer("/tool_choice/type").and_then(Value::as_str),
+        Some("tool" | "any")
+    )
 }
 
 fn reasoning_effort(request: &ChatCompletionRequest) -> Option<&str> {
@@ -1035,6 +1070,34 @@ mod tests {
                     choice
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_new_claude_model_inherits_the_newest_generation_rules() {
+        use super::{prefix_bound_thinking, rejects_forced_tool_choice};
+        // Every listed model keeps its answer.
+        for (model, bound, refuses) in [
+            ("claude-fable-5-1", true, true),
+            ("claude-mythos-5-1", false, true),
+            ("claude-opus-5-5", true, true),
+            ("claude-sonnet-5-5", true, true),
+            ("claude-haiku-5-5", true, false),
+            ("claude-opus-5-5-20261001", true, true),
+            ("claude-sonnet-5", false, false),
+            ("claude-opus-5", false, false),
+            ("claude-haiku-4-5-20251001", false, false),
+            ("claude-3-5-sonnet-20241022", false, false),
+            // Models no list named.
+            ("claude-opus-6", true, true),
+            ("claude-sonnet-5-7", true, true),
+            ("claude-haiku-6-1", true, false),
+            ("claude-mythos-5-5", true, true),
+            ("claude-aria-6", true, true),
+            ("gpt-9", false, false),
+        ] {
+            assert_eq!(prefix_bound_thinking(model), bound, "{model}");
+            assert_eq!(rejects_forced_tool_choice(model), refuses, "{model}");
         }
     }
 

@@ -123,8 +123,11 @@ For manual models, an effort maps to a budget: `minimal` and `low` 1,024, `mediu
 named 400. This follows Anthropic's
 [extended-thinking documentation](https://platform.claude.com/docs/en/build-with-claude/extended-thinking).
 
-Claude Fable 5.1 and Mythos 5.1 accept `auto` and `none` tool choice; a forced tool choice returns a named
-400 because those models do not support it.
+Claude Fable and Mythos from 5.1, and Opus and Sonnet from 5.5, accept only `auto` and `none` tool choice;
+a forced tool choice returns a named 400 because those models do not support it. Haiku accepts it. These
+rules follow the family and version in the id, so a newer Claude takes the rules of the newest generation.
+When another model still answers 400 to a forced choice (as Claude does when thinking is on), the request
+is sent once more with `auto`.
 
 Claude refuses a text block that is empty or only whitespace, so blank text parts are left out: a photo sent
 with an empty text part beside it reaches Claude as the photo alone. A data URL may carry parameters before
