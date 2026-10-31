@@ -588,7 +588,14 @@ fn anthropic_message(message: &Message) -> Result<Value, RouterError> {
         regular_content.clone()
     };
     if role == "assistant" {
-        for detail in &message.reasoning_details {
+        // Only Claude's own thinking goes back to Claude: another model's
+        // reasoning in the same chat (DeepSeek's through OpenRouter, OpenAI's
+        // encrypted items) has no Claude signature, and Anthropic refuses it.
+        for detail in message
+            .reasoning_details
+            .iter()
+            .filter(|detail| claude_reasoning(detail))
+        {
             match detail.get("type").and_then(Value::as_str) {
                 Some("reasoning.encrypted") => content.push(json!({
                     "type": "redacted_thinking", "data": detail.get("data").cloned().unwrap_or(Value::Null)
@@ -598,10 +605,7 @@ fn anthropic_message(message: &Message) -> Result<Value, RouterError> {
                     "thinking": detail.get("text").and_then(Value::as_str).unwrap_or_default(),
                     "signature": detail.get("signature").and_then(Value::as_str).unwrap_or_default()
                 })),
-                _ => return Err(RouterError::invalid(
-                    "unsupported Anthropic reasoning detail",
-                    "messages.reasoning_details",
-                )),
+                _ => {}
             }
         }
         content.extend(regular_content);
@@ -625,6 +629,27 @@ fn anthropic_message(message: &Message) -> Result<Value, RouterError> {
     }
     apply_message_cache_control(&mut content, message)?;
     Ok(json!({"role": role, "content": content}))
+}
+
+/// Whether a reasoning detail is Claude's own, which Claude can take back: an
+/// Anthropic-format detail (`anthropic-claude-v1`), or one without a format
+/// that carries a signature (older clients). A thinking block needs its
+/// signature; a redacted one its data.
+fn claude_reasoning(detail: &Value) -> bool {
+    let format = detail.get("format").and_then(Value::as_str);
+    let claude = format.is_none_or(|format| {
+        let format = format.to_ascii_lowercase();
+        format.contains("anthropic") || format.contains("claude")
+    });
+    let sealed = match detail.get("type").and_then(Value::as_str) {
+        Some("reasoning.text") => detail
+            .get("signature")
+            .and_then(Value::as_str)
+            .is_some_and(|signature| !signature.is_empty()),
+        Some("reasoning.encrypted") => detail.get("data").is_some_and(|data| !data.is_null()),
+        _ => false,
+    };
+    claude && sealed
 }
 
 /// Claude refuses a text block that is empty or only whitespace, such as the
@@ -944,6 +969,38 @@ mod tests {
     use serde_json::json;
 
     use super::{PromptUsage, anthropic_request, validate_nested_extensions};
+
+    #[test]
+    fn only_claude_reasoning_is_replayed_to_claude() {
+        // One chat: DeepSeek through OpenRouter, then GPT, then Claude, each with its reasoning.
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "claude-haiku-5-5",
+            "messages": [
+                {"role":"user","content":"read"},
+                {"role":"assistant","content":"done","reasoning_details":[
+                    {"type":"reasoning.text","text":"DeepSeek thinking","format":"unknown","index":0},
+                    {"type":"reasoning.encrypted","data":"opaque","format":"openai-responses-v1","index":1},
+                    {"type":"reasoning.summary","summary":"GPT summary","format":"openai-responses-v1","index":2},
+                    {"type":"reasoning.text","text":"Claude thinking","signature":"sig","format":"anthropic-claude-v1","index":3},
+                    {"type":"reasoning.encrypted","data":"redacted","format":"anthropic-claude-v1","index":4}
+                ]},
+                {"role":"user","content":"again"}
+            ]
+        }))
+        .unwrap();
+        let body = anthropic_request("claude-haiku-5-5", &request).unwrap();
+        let content = &body["messages"][1]["content"];
+        assert_eq!(
+            content[0],
+            json!({"type":"thinking","thinking":"Claude thinking","signature":"sig"})
+        );
+        assert_eq!(
+            content[1],
+            json!({"type":"redacted_thinking","data":"redacted"})
+        );
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content.as_array().unwrap().len(), 3, "{content}");
+    }
 
     #[test]
     fn current_fable_and_mythos_reject_forced_tools_locally() {
