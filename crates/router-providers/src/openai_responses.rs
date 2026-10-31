@@ -158,14 +158,12 @@ fn responses_request(model: &str, request: &ChatCompletionRequest) -> Result<Val
                 "messages",
             ));
         }
+        // Only OpenAI's own reasoning items go back: another model's reasoning
+        // in the same chat cannot be replayed to it, and is left out.
         for detail in &message.reasoning_details {
-            if detail["format"] != "openai-responses-v1" || detail["item"]["type"] != "reasoning" {
-                return Err(RouterError::invalid(
-                    "unsupported Responses reasoning history",
-                    "messages.reasoning_details",
-                ));
+            if detail["format"] == "openai-responses-v1" && detail["item"]["type"] == "reasoning" {
+                input.push(detail["item"].clone());
             }
-            input.push(detail["item"].clone());
         }
         if message.role == "tool" {
             let call_id = message.tool_call_id.as_deref().ok_or_else(|| {
@@ -310,6 +308,32 @@ fn responses_request(model: &str, request: &ChatCompletionRequest) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_openai_reasoning_is_replayed_to_openai() {
+        let item =
+            json!({"type":"reasoning","id":"rs_1","encrypted_content":"opaque","summary":[]});
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"openai/gpt-6-luna", "reasoning_effort":"low",
+            "messages":[
+                {"role":"user","content":"read"},
+                {"role":"assistant","content":"done","reasoning_details":[
+                    {"type":"reasoning.text","text":"DeepSeek thinking","format":"unknown"},
+                    {"type":"reasoning.text","text":"Claude thinking","signature":"sig","format":"anthropic-claude-v1"},
+                    {"format":"openai-responses-v1","item":item}
+                ]},
+                {"role":"user","content":"again"}
+            ]
+        })).unwrap();
+        let body = responses_request("gpt-6-luna", &request).unwrap();
+        let replayed: Vec<_> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["type"] == "reasoning")
+            .collect();
+        assert_eq!(replayed, [&item]);
+    }
 
     #[test]
     fn responses_preserves_non_strict_tools_and_stateless_reasoning_history() {
