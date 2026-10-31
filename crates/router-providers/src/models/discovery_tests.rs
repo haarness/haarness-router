@@ -221,3 +221,33 @@ async fn xai_discovers_its_chat_models_from_language_models() {
     assert_eq!(models[0].metadata["supports_vision"], json!(true));
     assert!(requests.lock().unwrap()[0].starts_with("GET /v1/language-models "));
 }
+
+#[tokio::test]
+async fn gemini_lists_a_new_generation_and_drops_what_cannot_chat() {
+    let (url, _, task) = fixture(|path| {
+        if path.starts_with("/models?") {
+            (
+                200,
+                json!({"models":[
+                    {"name":"models/gemini-5-flash","thinking":true,"supportedGenerationMethods":["generateContent","countTokens"]},
+                    {"name":"models/gemini-5-flash-live","supportedGenerationMethods":["bidiGenerateContent"]},
+                    {"name":"models/gemini-embedding-3","supportedGenerationMethods":["embedContent"]}
+                ]}),
+            )
+        } else {
+            (404, json!({}))
+        }
+    })
+    .await;
+    let config =
+        serde_json::from_value(json!({"kind":"gemini","base_url":url,"allow_insecure_http":true}))
+            .unwrap();
+    let models = from_adapter(config).await.unwrap();
+    task.abort();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "gemini-5-flash");
+    assert_eq!(
+        models[0].metadata["reasoning_efforts"],
+        json!(["low", "medium", "high"])
+    );
+}

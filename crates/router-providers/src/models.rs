@@ -10,6 +10,23 @@ mod bedrock;
 #[cfg(test)]
 mod discovery_tests;
 
+/// Kinds of model Gemini lists that cannot answer a chat, matched as whole
+/// segments of the id. Image models also go by the brand `nano-banana`.
+const GEMINI_NON_CHAT: [&str; 12] = [
+    "image",
+    "nano-banana",
+    "imagen",
+    "veo",
+    "lyria",
+    "embedding",
+    "tts",
+    "transcribe",
+    "native-audio",
+    "live",
+    "robotics",
+    "computer-use",
+];
+
 /// Account catalogs are data, not a whitelist for routing. Keep pagination,
 /// response sizes and time bounded, and never forward credentials on redirects.
 pub(crate) async fn discover(
@@ -222,22 +239,10 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
     if !chat_route || media_output {
         return None;
     }
+    // Gemini lists media generators, embeddings, speech and live-audio
+    // models beside its chat models, some of them with `generateContent`.
     if protocol == ProviderProtocol::GeminiGenerateContent
-        && (!(id.starts_with("gemini-") || id.starts_with("gemma-"))
-            || [
-                "image",
-                // Image models named after the brand, e.g. gemini-nano-banana-2.1.
-                "nano-banana",
-                "embedding",
-                "tts",
-                "transcribe",
-                "native-audio",
-                "live",
-                "robotics",
-                "computer-use",
-            ]
-            .iter()
-            .any(|part| id.contains(part)))
+        && GEMINI_NON_CHAT.iter().any(|word| names(id, word))
     {
         return None;
     }
@@ -302,9 +307,18 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
             metadata
                 .entry("supports_reasoning".into())
                 .or_insert(json!(true));
+            // A model the catalog says thinks keeps its levels even when its
+            // name is new to the table (`gemini-flash-latest`, a new family).
+            let known = gemini_reasoning_efforts(id);
             metadata
                 .entry("reasoning_efforts".into())
-                .or_insert_with(|| json!(gemini_reasoning_efforts(id)));
+                .or_insert_with(|| {
+                    json!(if known.is_empty() {
+                        GEMINI_NEWEST_EFFORTS.to_vec()
+                    } else {
+                        known
+                    })
+                });
         }
     } else if config.kind == ProviderKind::Xai {
         // Its multi-agent models answer only on the Responses API.
@@ -341,7 +355,7 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
         metadata
             .entry("supports_reasoning".into())
             .or_insert(json!(supports_reasoning));
-        if id.starts_with("gpt-5") || id.starts_with("gpt-6") {
+        if openai_reads_images(id) {
             metadata
                 .entry("supports_vision".into())
                 .or_insert(json!(true));
@@ -352,6 +366,14 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
         metadata
             .entry("reasoning_efforts".into())
             .or_insert_with(|| json!(efforts));
+    } else if let Some(inputs) = entry
+        .pointer("/architecture/input_modalities")
+        .and_then(Value::as_array)
+    {
+        // OpenRouter says what each model reads.
+        metadata
+            .entry("supports_vision".into())
+            .or_insert(json!(inputs.iter().any(|input| input == "image")));
     }
     if metadata.get("supports_reasoning") == Some(&json!(false)) {
         metadata.insert("reasoning_efforts".into(), json!([]));
@@ -371,72 +393,122 @@ fn copy(entry: &Value, from: &str, metadata: &mut BTreeMap<String, Value>, to: &
     }
 }
 
-fn openai_chat_model(id: &str) -> bool {
-    (id.starts_with("gpt-")
-        || id.starts_with("chatgpt-")
-        || id.starts_with("o1")
-        || id.starts_with("o3")
-        || id.starts_with("o4"))
-        && ![
-            "-realtime",
-            "-audio",
-            "-transcribe",
-            "-search",
-            "-deep-research",
-            "-image",
-            "-instruct",
-            "-tts",
-        ]
-        .iter()
-        .any(|part| id.contains(part))
+/// Whether `id` names `word` in whole segments: `gpt-realtime` names
+/// `realtime` and `o3-deep-research` names `deep-research`, while
+/// `gemini-deliverable` names no `live`.
+fn names(id: &str, word: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    let parts: Vec<&str> = id.split(['-', '.', '_', ':', '/']).collect();
+    let wanted: Vec<&str> = word.split('-').collect();
+    parts
+        .windows(wanted.len())
+        .any(|window| window == wanted.as_slice())
 }
 
-fn gpt5_minor(id: &str) -> Option<u32> {
-    let rest = id.strip_prefix("gpt-5")?;
-    let digits: String = rest
-        .strip_prefix(['.', '-'])?
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    // A four-digit hyphenated suffix starts a snapshot date, not a minor version.
-    if rest.starts_with('-') && digits.len() == 4 {
+/// Kinds of model `OpenAI` lists beside its chat models: speech, transcription,
+/// embeddings, moderation, image and video generation, the realtime and
+/// search-only variants, deep research and the completions-only models.
+const OPENAI_NON_CHAT: [&str; 16] = [
+    "audio",
+    "realtime",
+    "transcribe",
+    "tts",
+    "whisper",
+    "embedding",
+    "moderation",
+    "image",
+    "dall-e",
+    "sora",
+    "search",
+    "deep-research",
+    "instruct",
+    "davinci",
+    "babbage",
+    "computer-use",
+];
+
+/// Everything `OpenAI` lists is a chat model unless its id names a kind that
+/// is not, so a new family (`o5`, `gpt-7`) shows up without a release.
+fn openai_chat_model(id: &str) -> bool {
+    let family = openai_family(id);
+    !OPENAI_NON_CHAT.iter().any(|word| names(&family, word))
+}
+
+/// The base model of an id, lowercase: a fine-tune is
+/// `ft:<family>:<org>:<suffix>` and only the family says what it is.
+fn openai_family(id: &str) -> String {
+    let lower = id.to_ascii_lowercase();
+    let family = lower.strip_prefix("ft:").unwrap_or(&lower);
+    family.split(':').next().unwrap_or(family).to_owned()
+}
+
+/// A GPT id's version: `(5, None)` for `gpt-5-mini` and the snapshot
+/// `gpt-5-2025-08-07`, `(5, Some(1))` for `gpt-5.1` and `gpt-5-1`,
+/// `(7, None)` for `gpt-7`.
+fn gpt_version(family: &str) -> Option<(u32, Option<u32>)> {
+    let rest = family.strip_prefix("gpt-")?;
+    let major_len = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let major = rest[..major_len].parse().ok()?;
+    let rest = &rest[major_len..];
+    let minor = rest.strip_prefix(['.', '-']).and_then(|after| {
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        // A four-digit hyphenated suffix starts a snapshot date, not a minor version.
+        if rest.starts_with('-') && digits.len() == 4 {
+            return None;
+        }
+        digits.parse().ok()
+    });
+    Some((major, minor))
+}
+
+/// The number of an `o`-series reasoning model: 3 for `o3-mini`, 5 for `o5`.
+fn o_series(family: &str) -> Option<u32> {
+    let rest = family.strip_prefix('o')?;
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits == 0 || !(rest[digits..].is_empty() || rest[digits..].starts_with('-')) {
         return None;
     }
-    digits.parse().ok()
+    rest[..digits].parse().ok()
+}
+
+/// GPT-5 and later, and o4 and later, read images and call tools; a new
+/// generation is taken to do the same until its catalog entry says otherwise.
+fn openai_reads_images(id: &str) -> bool {
+    let family = openai_family(id);
+    gpt_version(&family).is_some_and(|(major, _)| major >= 5)
+        || o_series(&family).is_some_and(|number| number >= 4)
 }
 
 /// Reasoning tiers the public Responses API accepts per `OpenAI` model family,
 /// lightest first. GPT-5.1 replaced `minimal` with `none`, 5.2 added `xhigh`,
 /// 5.6 added `max`, GPT-6 Astra and GPT-6.1 Sol dropped `none`; GPT-6 Sol/Luna retain it. Codex, Pro and chat variants keep
-/// their own narrower sets. A request outside the set is a 400.
+/// their own narrower sets. A generation newer than these gets the newest
+/// set, and every `o` model the classic three. A catalog that lists the
+/// levels itself wins over this table.
 fn openai_reasoning_efforts(id: &str) -> Vec<&'static str> {
-    let lower = id.to_ascii_lowercase();
-    // A fine-tune is `ft:<family>:<org>:<suffix>`; only the family matters.
-    let family = lower.strip_prefix("ft:").unwrap_or(&lower);
-    let family = family.split(':').next().unwrap_or(family);
+    let family = openai_family(id);
     let segment = |name: &str| family.split(['-', '.']).any(|part| part == name);
-    if family.contains("deep-research") {
+    if names(&family, "deep-research") {
         return vec!["medium"];
     }
-    if family.starts_with("gpt-6") {
+    if o_series(&family).is_some() {
+        return vec!["low", "medium", "high"];
+    }
+    let Some((major, minor)) = gpt_version(&family) else {
+        return Vec::new();
+    };
+    if major < 5 || segment("chat") {
+        return Vec::new();
+    }
+    if major >= 6 {
         if family.starts_with("gpt-6-sol") || family.starts_with("gpt-6-luna") {
             return vec!["none", "low", "medium", "high", "xhigh", "max"];
         }
         return vec!["low", "medium", "high", "xhigh", "max"];
-    }
-    if !family.starts_with("gpt-5") {
-        return if ["o1", "o3", "o4"]
-            .iter()
-            .any(|prefix| family.starts_with(prefix))
-        {
-            vec!["low", "medium", "high"]
-        } else {
-            Vec::new()
-        };
-    }
-    let minor = gpt5_minor(family);
-    if segment("chat") {
-        return Vec::new();
     }
     if segment("pro") {
         return if minor.is_some() {
@@ -471,6 +543,10 @@ fn gemini_generation(id: &str) -> Option<u32> {
     name[..digits].parse().ok()
 }
 
+/// The levels of the newest Gemini generations, for a thinking model the
+/// table below does not name.
+pub(crate) const GEMINI_NEWEST_EFFORTS: [&str; 3] = ["low", "medium", "high"];
+
 /// Model-family fallback only; provider-advertised capabilities take precedence.
 pub(crate) fn gemini_reasoning_efforts(id: &str) -> Vec<&'static str> {
     // Probed 2026-10-15: Gemini 4 Argon answers `minimal` with a 400, as
@@ -480,7 +556,7 @@ pub(crate) fn gemini_reasoning_efforts(id: &str) -> Vec<&'static str> {
         || id.starts_with("gemini-3.1-pro")
         || gemini_generation(id).is_some_and(|generation| generation >= 4)
     {
-        vec!["low", "medium", "high"]
+        GEMINI_NEWEST_EFFORTS.to_vec()
     } else if id.starts_with("gemini-3-pro") {
         vec!["low", "high"]
     } else if id.starts_with("gemini-3") {
@@ -492,6 +568,38 @@ pub(crate) fn gemini_reasoning_efforts(id: &str) -> Vec<&'static str> {
     } else {
         Vec::new()
     }
+}
+
+/// A reasoning level's place on the scale, lightest first. A level the scale
+/// does not know (a provider's own `ultra`) ranks strongest.
+fn effort_rank(level: &str) -> u8 {
+    match level {
+        "none" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        "max" => 6,
+        _ => 7,
+    }
+}
+
+/// The level of `supported` closest to `wanted`: `wanted` itself when listed,
+/// otherwise the nearest on the scale, the stronger of two equally near.
+pub(crate) fn nearest_effort<'a>(wanted: &'a str, supported: &[&'a str]) -> &'a str {
+    if supported.is_empty() || supported.contains(&wanted) {
+        return wanted;
+    }
+    let rank = effort_rank(wanted);
+    supported
+        .iter()
+        .copied()
+        .min_by_key(|level| {
+            let other = effort_rank(level);
+            (rank.abs_diff(other), std::cmp::Reverse(other))
+        })
+        .unwrap_or(wanted)
 }
 
 #[cfg(test)]
@@ -588,9 +696,133 @@ mod tests {
             "gpt-realtime",
             "text-embedding-3-small",
             "o3-deep-research",
+            "o4-mini-deep-research",
+            "gpt-4o-mini-transcribe",
+            "gpt-4o-mini-tts",
+            "tts-1-hd",
+            "whisper-1",
+            "dall-e-3",
+            "sora-2",
+            "omni-moderation-latest",
+            "gpt-5-search-api",
+            "gpt-3.5-turbo-instruct",
+            "davinci-002",
+            "gpt-audio-mini",
+            "chatgpt-image-latest",
+            "computer-use-preview",
         ] {
-            assert!(!openai_chat_model(id));
+            assert!(!openai_chat_model(id), "{id}");
         }
+    }
+
+    #[test]
+    fn an_unknown_new_openai_model_is_listed_with_the_newest_behaviour() {
+        let config: ProviderConfig = serde_json::from_value(json!({"kind":"openai"})).unwrap();
+        // Families no table names yet, and a name that only contains a
+        // non-chat word inside a segment.
+        for id in [
+            "o5-mini",
+            "o5",
+            "gpt-7",
+            "gpt-7.2-nova",
+            "orion-1",
+            "gpt-5.6-imagery",
+        ] {
+            assert!(openai_chat_model(id), "{id}");
+        }
+        let o5 = model_entry(&config, &json!({"id":"o5-mini"})).unwrap();
+        assert_eq!(o5.metadata["supports_reasoning"], true);
+        assert_eq!(
+            o5.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
+        assert_eq!(o5.metadata["supports_vision"], true);
+        let gpt7 = model_entry(&config, &json!({"id":"gpt-7"})).unwrap();
+        assert_eq!(
+            gpt7.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(gpt7.metadata["supports_vision"], true);
+        assert_eq!(gpt7.metadata["supports_tools"], true);
+        let chat = model_entry(&config, &json!({"id":"gpt-7-chat-latest"})).unwrap();
+        assert_eq!(chat.metadata["supports_reasoning"], false);
+        // A family nothing describes stays listed, reasoning only when its
+        // entry says so.
+        let other = model_entry(&config, &json!({"id":"orion-1"})).unwrap();
+        assert_eq!(other.metadata["supports_reasoning"], false);
+        let said = model_entry(
+            &config,
+            &json!({"id":"orion-1","reasoning_efforts":["low","ultra"]}),
+        )
+        .unwrap();
+        assert_eq!(said.metadata["supports_reasoning"], true);
+        assert_eq!(said.metadata["reasoning_efforts"], json!(["low", "ultra"]));
+        // o3-mini reads no images; nothing is claimed for it.
+        let o3 = model_entry(&config, &json!({"id":"o3-mini"})).unwrap();
+        assert!(!o3.metadata.contains_key("supports_vision"));
+    }
+
+    #[test]
+    fn an_unknown_new_gemini_model_is_listed_when_it_generates_content() {
+        let config: ProviderConfig = serde_json::from_value(json!({"kind":"gemini"})).unwrap();
+        let entry = |id: &str, thinking: Option<bool>| {
+            let mut entry = json!({"name":format!("models/{id}"),"supportedGenerationMethods":["generateContent","countTokens"]});
+            if let Some(thinking) = thinking {
+                entry["thinking"] = json!(thinking);
+            }
+            model_entry(&config, &entry)
+        };
+        let next = entry("gemini-5-flash", Some(true)).unwrap();
+        assert_eq!(next.metadata["supports_reasoning"], true);
+        assert_eq!(
+            next.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
+        assert_eq!(next.metadata["supports_vision"], true);
+        // Neither prefix nor table knows these; the catalog says they think.
+        let alias = entry("gemini-flash-latest", Some(true)).unwrap();
+        assert_eq!(
+            alias.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
+        assert!(entry("learnlm-3.0-flash", None).is_some());
+        // Whole segments only: `deliverable` is not `live`.
+        assert!(entry("gemini-5-deliverable", Some(false)).is_some());
+        for id in [
+            "gemini-5-flash-live",
+            "gemini-5-flash-native-audio-preview",
+            "gemini-5-flash-image",
+            "imagen-5",
+            "lyria-3",
+            "gemini-5-flash-preview-tts",
+        ] {
+            assert!(entry(id, None).is_none(), "{id}");
+        }
+        let without =
+            json!({"name":"models/gemini-5-embed","supportedGenerationMethods":["embedContent"]});
+        assert!(model_entry(&config, &without).is_none());
+    }
+
+    #[test]
+    fn nearest_effort_keeps_listed_levels_and_moves_others_to_the_closest() {
+        assert_eq!(nearest_effort("high", &["low", "high"]), "high");
+        assert_eq!(nearest_effort("medium", &["low", "high"]), "high");
+        assert_eq!(nearest_effort("none", &["low", "medium"]), "low");
+        assert_eq!(nearest_effort("ultra", &["low", "max"]), "max");
+        assert_eq!(nearest_effort("max", &["low", "ultra"]), "ultra");
+        assert_eq!(nearest_effort("ultra", &[]), "ultra");
+    }
+
+    #[test]
+    fn openrouter_entries_say_whether_the_model_reads_images() {
+        let config: ProviderConfig = serde_json::from_value(
+            json!({"kind":"openai-compatible","base_url":"https://openrouter.ai/api/v1"}),
+        )
+        .unwrap();
+        let text = model_entry(&config, &json!({"id":"deepseek/deepseek-v4","architecture":{"input_modalities":["text"],"output_modalities":["text"]}})).unwrap();
+        assert_eq!(text.metadata["supports_vision"], false);
+        let sees = model_entry(&config, &json!({"id":"x-ai/grok-5","architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}})).unwrap();
+        assert_eq!(sees.metadata["supports_vision"], true);
     }
 
     #[test]

@@ -94,8 +94,9 @@ capabilities = { text = true, streaming = true, function_tools = true, parallel_
 Discovered models carry provider metadata — `supports_reasoning`, `reasoning_efforts`, tool and image
 support and token limits — and explicit live metadata wins over family defaults. Anthropic's per-level
 capability flags decide its effort choices. OpenAI's catalog has no effort metadata, so documented
-model-family defaults live in `crates/router-providers/src/models.rs`. A provider that publishes its own
-effort list needs no client changes.
+model-family defaults live in `crates/router-providers/src/models.rs`; a newer GPT or `o` generation than
+the table names gets the newest family's levels, images and tools. A provider that publishes its own effort
+list needs no client changes.
 
 ## Reasoning
 
@@ -137,8 +138,10 @@ Flash and 3.1 Pro offer `low`, `medium` and `high`; Gemini 3 Pro `low` and `high
 only where thinking can be turned off). Thinking counts against the output limit, so with `max_tokens` or
 `max_completion_tokens` set an effort's budget is at most half of it and a short answer keeps room; it stays on
 unless half the limit is less than the model thinks at all, when 2.5 Pro thinks its minimum of 128 tokens and
-Flash and Flash-Lite (512 at least) stop thinking. A `reasoning.max_tokens` budget is sent as given. An
-unsupported level is refused before Google is called. See
+Flash and Flash-Lite (512 at least) stop thinking. A `reasoning.max_tokens` budget is sent as given. A
+level the model does not offer becomes its nearest offered level (the stronger of two equally near); the
+levels come from the catalog when it was read, else from the table above, and a thinking model of a newer
+generation gets the newest levels. A model neither knows gets the level as asked. See
 Google's [thinking guide](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
 
 Gemini usage counts candidate and thought tokens as completion tokens, with reasoning as a subset and cached

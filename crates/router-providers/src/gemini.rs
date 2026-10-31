@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -23,6 +23,8 @@ pub struct GeminiAdapter {
     transport: ProviderTransport,
     base_url: String,
     bearer_auth: bool,
+    /// Reasoning levels per model from the last successful catalog read.
+    levels: std::sync::RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl GeminiAdapter {
@@ -31,6 +33,7 @@ impl GeminiAdapter {
             transport: ProviderTransport::new(config)?,
             base_url: config.effective_base_url()?,
             bearer_auth: config.auth_header.as_deref() == Some("authorization"),
+            levels: std::sync::RwLock::default(),
         })
     }
 }
@@ -42,7 +45,22 @@ impl ProviderAdapter for GeminiAdapter {
         config: &ProviderConfig,
         api_key: Option<&SecretString>,
     ) -> Option<Vec<router_protocol::ModelObject>> {
-        crate::models::discover(config, api_key).await
+        let models = crate::models::discover(config, api_key).await?;
+        let levels = models
+            .iter()
+            .filter_map(|model| {
+                let levels = model.metadata.get("reasoning_efforts")?.as_array()?;
+                let levels = levels
+                    .iter()
+                    .filter_map(|level| level.as_str().map(str::to_owned))
+                    .collect();
+                Some((model.id.clone(), levels))
+            })
+            .collect();
+        if let Ok(mut known) = self.levels.write() {
+            *known = levels;
+        }
+        Some(models)
     }
 
     async fn stream(
@@ -71,7 +89,12 @@ impl ProviderAdapter for GeminiAdapter {
         prepare_pdf_fallback(&mut request, capabilities).await?;
         // The router target, not a public alias, determines thinking syntax.
         request.model = model.to_owned();
-        let body = gemini_request(&request)?;
+        let levels = self
+            .levels
+            .read()
+            .ok()
+            .and_then(|known| known.get(model).cloned());
+        let body = gemini_request_with_levels(&request, levels.as_deref())?;
         let url = format!(
             "{}/models/{model}:streamGenerateContent?alt=sse",
             self.base_url.trim_end_matches('/')
@@ -184,7 +207,17 @@ fn gemini_usage(usage: &Value) -> Usage {
     }
 }
 
+#[cfg(test)]
 fn gemini_request(request: &ChatCompletionRequest) -> Result<Value, RouterError> {
+    gemini_request_with_levels(request, None)
+}
+
+/// The Gemini request for `request`; `known_levels` are the reasoning levels
+/// the provider's catalog listed for the model, when it was read.
+fn gemini_request_with_levels(
+    request: &ChatCompletionRequest,
+    known_levels: Option<&[String]>,
+) -> Result<Value, RouterError> {
     reject_unsupported_parameters(request)?;
     let call_names = request
         .messages
@@ -349,29 +382,23 @@ fn gemini_request(request: &ChatCompletionRequest) -> Result<Value, RouterError>
         if let Some(tokens) = budget {
             thinking["thinkingBudget"] = tokens.into();
         } else if let Some(effort) = effort {
-            let levels = crate::models::gemini_reasoning_efforts(&request.model);
-            if !levels.is_empty() && !levels.contains(&effort) {
-                return Err(RouterError::invalid(
-                    format!(
-                        "{} does not support reasoning effort {effort}",
-                        request.model
-                    ),
-                    "reasoning_effort",
-                ));
-            }
+            // The catalog's levels for this model, else the table's. A level
+            // the model lacks becomes its nearest one; a model neither knows
+            // gets the level as asked and the provider decides.
+            let levels: Vec<&str> = match known_levels {
+                Some(levels) if !levels.is_empty() => levels.iter().map(String::as_str).collect(),
+                _ => crate::models::gemini_reasoning_efforts(&request.model),
+            };
+            let effort = crate::models::nearest_effort(effort, &levels);
             if request.model.starts_with("gemini-2.5") {
-                let budget = match effort {
-                    "none" => 0,
-                    "low" => 2_048,
-                    "medium" => 8_192,
-                    "high" => 24_576,
-                    _ => {
-                        return Err(RouterError::invalid(
-                            "unsupported Gemini reasoning effort",
-                            "reasoning_effort",
-                        ));
-                    }
-                };
+                let budget =
+                    match crate::models::nearest_effort(effort, &["none", "low", "medium", "high"])
+                    {
+                        "none" => 0,
+                        "low" => 2_048,
+                        "medium" => 8_192,
+                        _ => 24_576,
+                    };
                 let limit = request.max_completion_tokens.or(request.max_tokens);
                 thinking["thinkingBudget"] =
                     json!(within_output_limit(&request.model, budget, limit));
@@ -663,7 +690,7 @@ mod tests {
     use router_protocol::ChatCompletionRequest;
     use serde_json::{Value, json};
 
-    use super::gemini_request;
+    use super::{gemini_request, gemini_request_with_levels};
 
     #[test]
     fn usage_includes_reasoning_output_and_cached_input() {
@@ -762,19 +789,47 @@ mod tests {
                 assert_eq!(thinking["includeThoughts"], true);
             }
         }
-        for (model, effort) in [
-            ("gemini-4-argon", "minimal"),
-            ("gemini-4-argon", "none"),
-            ("gemini-3.8-flash", "minimal"),
-            ("gemini-3-pro-preview", "medium"),
-            ("gemini-2.5-pro", "none"),
-        ] {
+        // A level the model lacks becomes its nearest one instead of a 400
+        // from the router: Gemini 4 and 3.8 Flash have no `minimal` or `none`.
+        let level = |model: &str, effort: &str, known: Option<&[String]>| {
             let request = serde_json::from_value(
                 json!({"model":model,"messages":[],"reasoning_effort":effort}),
             )
             .unwrap();
-            assert!(gemini_request(&request).is_err());
+            let body = gemini_request_with_levels(&request, known).unwrap();
+            body["generationConfig"]["thinkingConfig"].clone()
+        };
+        for (model, effort, expected) in [
+            ("gemini-4-argon", "minimal", "low"),
+            ("gemini-4-argon", "none", "low"),
+            ("gemini-4-argon", "max", "high"),
+            ("gemini-3.8-flash", "minimal", "low"),
+            ("gemini-3-pro-preview", "medium", "high"),
+            // A generation the table has never seen gets the newest levels.
+            ("gemini-5-flash", "xhigh", "high"),
+        ] {
+            assert_eq!(
+                level(model, effort, None)["thinkingLevel"],
+                expected,
+                "{model} {effort}"
+            );
         }
+        assert_eq!(
+            level("gemini-2.5-pro", "none", None)["thinkingBudget"],
+            2_048
+        );
+        // The catalog's levels win over the table's.
+        let listed = ["minimal".to_owned(), "low".to_owned(), "ultra".to_owned()];
+        assert_eq!(
+            level("gemini-4-argon", "minimal", Some(&listed))["thinkingLevel"],
+            "minimal"
+        );
+        assert_eq!(
+            level("gemini-4-argon", "max", Some(&listed))["thinkingLevel"],
+            "ultra"
+        );
+        // A model neither knows gets the level as asked; the provider decides.
+        assert_eq!(level("learnlm-9", "ultra", None)["thinkingLevel"], "ultra");
     }
 
     #[test]
