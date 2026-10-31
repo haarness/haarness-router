@@ -43,6 +43,13 @@ pub enum ProviderEvent {
         index: u32,
         detail: serde_json::Value,
     },
+    /// Reasoning text that arrived with the details carrying it, as one upstream chunk (`OpenRouter` sends both).
+    /// Kept together so clients see the text once.
+    Reasoning {
+        index: u32,
+        text: String,
+        details: Vec<serde_json::Value>,
+    },
     ToolCallDelta {
         choice_index: u32,
         tool_index: u32,

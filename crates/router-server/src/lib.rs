@@ -416,6 +416,14 @@ fn streaming_response(
                 // Internal: only the final usage reaches clients.
                 Ok(ProviderEvent::PromptUsage(_)) => continue,
                 Ok(ProviderEvent::ReasoningDelta { .. }) if exclude_reasoning => continue,
+                // Without reasoning text the details still travel, for the next turn's replay.
+                Ok(ProviderEvent::Reasoning { index, details, .. }) if exclude_reasoning => chunk_for_event(
+                    &response_id,
+                    &model,
+                    created,
+                    ProviderEvent::Reasoning { index, text: String::new(), details },
+                    &mut announced,
+                ),
                 Ok(event) => chunk_for_event(&response_id, &model, created, event, &mut announced),
                 Err(error) => {
                     metrics.error();
@@ -484,6 +492,19 @@ async fn nonstream_response(
                 &mut choices.entry(index).or_default().reasoning_details,
                 detail,
             ),
+            ProviderEvent::Reasoning {
+                index,
+                text,
+                details,
+            } => {
+                let choice = choices.entry(index).or_default();
+                if !routed.exclude_reasoning {
+                    choice.reasoning.push_str(&text);
+                }
+                for detail in details {
+                    merge_reasoning_detail(&mut choice.reasoning_details, detail);
+                }
+            }
             ProviderEvent::ToolCallDelta {
                 choice_index,
                 tool_index,
@@ -691,6 +712,22 @@ fn chunk_for_event(
             let role = announced.insert(index).then_some("assistant");
             base(
                 json!([{"index":index,"delta":{"role":role,"reasoning_details":[detail]},"finish_reason":null,"logprobs":null}]),
+                Value::Null,
+            )
+        }
+        ProviderEvent::Reasoning {
+            index,
+            text,
+            details,
+        } => {
+            let role = announced.insert(index).then_some("assistant");
+            let delta = if text.is_empty() {
+                json!({"role":role,"reasoning_details":details})
+            } else {
+                json!({"role":role,"reasoning":text,"reasoning_content":text,"reasoning_details":details})
+            };
+            base(
+                json!([{"index":index,"delta":delta,"finish_reason":null,"logprobs":null}]),
                 Value::Null,
             )
         }
