@@ -105,9 +105,12 @@ Errors use the OpenAI envelope:
 An upstream HTTP error keeps its status and gets the code `upstream_<status>` (for example
 `upstream_429`). Its message names at most the provider's machine-readable error type, such as
 `upstream returned HTTP 429 (rate_limit_error)`: the provider's own message and body are never passed on,
-because they can echo prompts or credentials. Transport failures are `502 upstream_transport_error` and
-deadlines `504 upstream_timeout`. When every target of an alias failed, the last retryable error is
-returned, or `503 no_route_available` when no target could be tried (for example, every circuit is open).
+because they can echo prompts or credentials. When a provider refuses a model as unknown (a 404 or a
+`model_not_found` type) and its catalog has been read, the message goes on to name up to three models it
+lists now, closest names first, for example `upstream returned HTTP 404 (model_not_found). openai no longer
+lists gpt-6; try openai/gpt-7, openai/gpt-7-mini or openai/o5.` Status and code stay the same. Transport
+failures are `502 upstream_transport_error` and deadlines `504 upstream_timeout`. When every target of an
+alias failed, the last retryable error is returned, or `503 no_route_available` when no target could be tried (for example, every circuit is open).
 
 A router that has no provider for the request says what to set up instead, with `param` `model`:
 `400 no_providers_configured` when it has no providers at all, and, for a router started
@@ -127,8 +130,13 @@ models, discovered with the server's provider keys (never the caller's router ke
 - Discovery runs when the endpoint is called, at most once every five minutes; simultaneous calls share
   one refresh, and a failed refresh keeps the last complete catalog.
 - Each provider's refresh is bounded to ten seconds, ten pages and 4 MiB per page.
-- Embeddings, realtime and media-generation-only models are left out. Entries carry provider metadata
-  such as `supports_reasoning`, `reasoning_efforts`, tool and image support and token limits when known.
+- Embeddings, realtime and media-generation-only models are left out by the kind of model their id names,
+  so a new chat family appears without a router release. Entries carry provider metadata such as
+  `supports_reasoning`, `reasoning_efforts`, tool and image support and token limits when known.
+- A declared model that its provider's latest successful, non-empty catalog no longer lists is left out of
+  the list, unless an alias targets it. It can still be called by name.
+- When a target declares no capabilities of its own, its catalog entry narrows the provider's: a model
+  listed as text-only is not sent images, and the request gets the usual capability error.
 
 A listed model is not a promise that the account can generate with it, and an unlisted one can still be
 called by its exact `provider/model` name.

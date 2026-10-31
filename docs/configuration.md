@@ -205,8 +205,9 @@ serves `work/<model>`.
 
 ### `[models."<provider>/<model>"]`
 
-Declaring a model lists it in `/v1/models` even when discovery fails, gives it its own circuit breaker and
-metrics labels, and lets it override capabilities:
+Declaring a model lists it in `/v1/models` even when discovery fails (but not once its provider's catalog
+stops listing it, unless an alias targets it), gives it its own circuit breaker and metrics labels, and lets
+it override capabilities:
 
 | Key | Default | Meaning |
 | --- | --- | --- |

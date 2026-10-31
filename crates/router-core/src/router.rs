@@ -258,31 +258,162 @@ impl Router {
             owned_by: "haarness-router".into(),
             metadata: BTreeMap::default(),
         });
-        let concrete = self.config.models.keys().map(|id| ModelObject {
-            id: id.clone(),
-            object: "model".into(),
-            created,
-            owned_by: id
-                .split_once('/')
-                .map_or("unknown", |(provider, _)| provider)
-                .into(),
-            metadata: BTreeMap::default(),
-        });
+        let catalogs = self.model_catalog.lock().expect("model catalog lock");
+        let alias_targets = self
+            .config
+            .aliases
+            .values()
+            .flat_map(|alias| &alias.targets)
+            .collect::<std::collections::HashSet<_>>();
+        // A declared model its provider's latest catalog no longer lists has
+        // most likely been retired; it stays routable, but is not offered.
+        // An alias that targets it keeps it listed, and a provider that could
+        // not be read or listed nothing proves nothing.
+        let still_listed = |id: &&String| {
+            let Ok((provider, _)) = split_target(id) else {
+                return true;
+            };
+            match catalogs.get(provider) {
+                Some(listed) if !listed.is_empty() => {
+                    alias_targets.contains(id) || listed.iter().any(|model| &model.id == *id)
+                }
+                _ => true,
+            }
+        };
+        let concrete = self
+            .config
+            .models
+            .keys()
+            .filter(still_listed)
+            .map(|id| ModelObject {
+                id: id.clone(),
+                object: "model".into(),
+                created,
+                owned_by: id
+                    .split_once('/')
+                    .map_or("unknown", |(provider, _)| provider)
+                    .into(),
+                metadata: BTreeMap::default(),
+            });
         let mut models = aliases
             .chain(concrete)
             .map(|model| (model.id.clone(), model))
             .collect::<std::collections::BTreeMap<_, _>>();
-        for catalog in self
-            .model_catalog
-            .lock()
-            .expect("model catalog lock")
-            .values()
-        {
+        for catalog in catalogs.values() {
             for model in catalog {
                 models.insert(model.id.clone(), model.clone());
             }
         }
         models.into_values().collect()
+    }
+
+    /// `capabilities` narrowed (or, for kind defaults, completed) by what the
+    /// provider's catalog says of `target`: a model it lists as text-only is
+    /// not sent images, whatever the provider kind usually reads.
+    fn with_discovered(
+        &self,
+        target: &str,
+        mut capabilities: crate::Capabilities,
+        declared: bool,
+    ) -> crate::Capabilities {
+        let Ok((provider, _)) = split_target(target) else {
+            return capabilities;
+        };
+        let catalogs = self.model_catalog.lock().expect("model catalog lock");
+        let Some(model) = catalogs
+            .get(provider)
+            .and_then(|listed| listed.iter().find(|model| model.id == target))
+        else {
+            return capabilities;
+        };
+        let said = |field: &str| {
+            model
+                .metadata
+                .get(field)
+                .and_then(serde_json::Value::as_bool)
+        };
+        // Settings the operator wrote for the provider are only narrowed.
+        if let Some(images) = said("supports_vision")
+            && (!images || !declared)
+        {
+            capabilities.images = images;
+        }
+        if let Some(tools) = said("supports_tools")
+            && (!tools || !declared)
+        {
+            capabilities.function_tools = tools;
+            if !tools {
+                capabilities.custom_tools = false;
+                capabilities.parallel_tools = false;
+            }
+        }
+        // A model that does not think may still be sent `reasoning_effort:
+        // none`, so a catalog only ever adds reasoning.
+        if said("supports_reasoning") == Some(true) && !declared {
+            capabilities.reasoning = true;
+        }
+        capabilities
+    }
+
+    /// An upstream refusal of `target` as unknown, with up to three models its
+    /// provider lists now, so a client on a retired model learns what to use.
+    /// Status, type and code stay as they were.
+    fn with_listed_alternatives(&self, mut error: RouterError, target: &str) -> RouterError {
+        let unknown = error.status == http::StatusCode::NOT_FOUND
+            || (error.status.is_client_error()
+                && ["model_not_found", "not_found"]
+                    .iter()
+                    .any(|code| error.body.message.contains(&format!("({code}"))));
+        let Ok((provider, model)) = split_target(target) else {
+            return error;
+        };
+        if !unknown {
+            return error;
+        }
+        let catalogs = self.model_catalog.lock().expect("model catalog lock");
+        let Some(listed) = catalogs.get(provider) else {
+            return error;
+        };
+        let shared = |id: &str| {
+            id.split_once('/')
+                .map_or(id, |(_, rest)| rest)
+                .chars()
+                .zip(model.chars())
+                .take_while(|(left, right)| left == right)
+                .count()
+        };
+        let mut others = listed
+            .iter()
+            .filter(|candidate| candidate.id != target)
+            .collect::<Vec<_>>();
+        if others.is_empty() {
+            return error;
+        }
+        // Closest names first, then the newest.
+        others.sort_by(|left, right| {
+            shared(&right.id)
+                .cmp(&shared(&left.id))
+                .then(right.created.cmp(&left.created))
+                .then(left.id.cmp(&right.id))
+        });
+        let names = others
+            .iter()
+            .take(3)
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>();
+        let names = match names.as_slice() {
+            [one] => (*one).to_owned(),
+            [first @ .., last] => format!("{} or {last}", first.join(", ")),
+            [] => return error,
+        };
+        let still = listed.iter().any(|candidate| candidate.id == target);
+        let lead = if still {
+            format!("{provider} would not serve {model}")
+        } else {
+            format!("{provider} no longer lists {model}")
+        };
+        error.body.message = format!("{}. {lead}; try {names}.", error.body.message);
+        error
     }
 
     /// Refresh account-visible models without putting discovery on the chat path.
@@ -414,7 +545,13 @@ impl Router {
                 .models
                 .get(&target)
                 .and_then(|model| model.capabilities)
-                .unwrap_or_else(|| runtime.config.effective_capabilities());
+                .unwrap_or_else(|| {
+                    self.with_discovered(
+                        &target,
+                        runtime.config.effective_capabilities(),
+                        runtime.config.capabilities.is_some(),
+                    )
+                });
             let missing = capabilities.missing(&requirements);
             if !missing.is_empty() {
                 capability_failures.push(format!("{target}: missing {}", missing.join(", ")));
@@ -486,7 +623,7 @@ impl Router {
                     } else {
                         runtime.breaker.success(circuit_permit);
                     }
-                    return Err(error);
+                    return Err(self.with_listed_alternatives(error, &target));
                 }
             };
             let first = tokio::select! {
@@ -529,7 +666,7 @@ impl Router {
                     } else {
                         runtime.breaker.success(circuit_permit);
                     }
-                    return Err(with_request_id(error));
+                    return Err(self.with_listed_alternatives(with_request_id(error), &target));
                 }
                 Ok(None) => {
                     runtime.breaker.failure(circuit_permit);
@@ -861,6 +998,13 @@ fn unix_time() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use router_protocol::ModelObject;
+
     use super::AuthStore;
 
     #[tokio::test]
@@ -1126,6 +1270,232 @@ mod tests {
         assert!(
             router.models(0).is_empty(),
             "successful empty catalog removes discovered models"
+        );
+    }
+
+    /// A provider whose catalog the test sets, answering every chat with
+    /// `answer` (an upstream 404 when it is `None`).
+    struct Listed {
+        catalog: Mutex<Option<Vec<ModelObject>>>,
+        answer: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::ProviderAdapter for Listed {
+        async fn discover_models(
+            &self,
+            _: &crate::ProviderConfig,
+            _: Option<&secrecy::SecretString>,
+        ) -> Option<Vec<ModelObject>> {
+            self.catalog.lock().unwrap().clone()
+        }
+        async fn stream(
+            &self,
+            _: &str,
+            _: router_protocol::ChatCompletionRequest,
+            _: crate::Capabilities,
+            _: Option<&secrecy::SecretString>,
+            _: tokio_util::sync::CancellationToken,
+        ) -> Result<super::EventStream, crate::RouterError> {
+            let Some(text) = self.answer else {
+                return Err(crate::RouterError::upstream(
+                    http::StatusCode::NOT_FOUND,
+                    "upstream returned HTTP 404 (model_not_found)",
+                ));
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(
+                super::ProviderEvent::TextDelta {
+                    index: 0,
+                    text: text.into(),
+                },
+            )])))
+        }
+    }
+
+    fn listed(id: &str, created: u64, metadata: serde_json::Value) -> ModelObject {
+        let mut entry =
+            serde_json::json!({"id": id, "object": "model", "created": created, "owned_by": ""});
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(metadata.as_object().unwrap().clone());
+        serde_json::from_value(entry).unwrap()
+    }
+
+    fn listed_router(config: serde_json::Value, adapter: Arc<Listed>) -> super::Router {
+        let config: crate::AppConfig = serde_json::from_value(config).unwrap();
+        super::Router::with_provider_keys(
+            config,
+            HashMap::from([("p".into(), adapter as Arc<dyn super::ProviderAdapter>)]),
+            HashMap::from([("p".into(), secrecy::SecretString::from("k"))]),
+        )
+        .unwrap()
+    }
+
+    async fn refresh(router: &super::Router) {
+        *router.model_refresh.lock().await = None;
+        router.refresh_models().await;
+    }
+
+    #[tokio::test]
+    async fn a_declared_model_the_catalog_no_longer_lists_is_not_offered() {
+        let adapter = Arc::new(Listed {
+            catalog: Mutex::new(Some(vec![listed("gpt-7", 2, serde_json::json!({}))])),
+            answer: Some("ok"),
+        });
+        let router = listed_router(
+            serde_json::json!({"auth":{"enabled":false},
+                "providers":{"p":{"kind":"openai-compatible","base_url":"https://example.test/v1"}},
+                "models":{"p/gpt-old":{},"p/gpt-kept":{},"p/gpt-7":{}},
+                "aliases":{"kept":{"targets":["p/gpt-kept"]}}}),
+            adapter.clone(),
+        );
+        let ids = |router: &super::Router| {
+            router
+                .models(0)
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>()
+        };
+        // Before any catalog read every declared model is offered.
+        assert_eq!(ids(&router), ["kept", "p/gpt-7", "p/gpt-kept", "p/gpt-old"]);
+        refresh(&router).await;
+        // An alias still targets p/gpt-kept, so it stays.
+        assert_eq!(ids(&router), ["kept", "p/gpt-7", "p/gpt-kept"]);
+        // A failed read keeps the last list, and with it the same answer.
+        *adapter.catalog.lock().unwrap() = None;
+        refresh(&router).await;
+        assert_eq!(ids(&router), ["kept", "p/gpt-7", "p/gpt-kept"]);
+        // A model that disappears from the catalog leaves the list.
+        *adapter.catalog.lock().unwrap() = Some(vec![listed("gpt-8", 3, serde_json::json!({}))]);
+        refresh(&router).await;
+        assert_eq!(ids(&router), ["kept", "p/gpt-8", "p/gpt-kept"]);
+        // An empty catalog proves nothing about declared models.
+        *adapter.catalog.lock().unwrap() = Some(Vec::new());
+        refresh(&router).await;
+        assert_eq!(ids(&router), ["kept", "p/gpt-7", "p/gpt-kept", "p/gpt-old"]);
+        // A model no longer listed is still sent upstream when asked for.
+        let request = serde_json::from_value(
+            serde_json::json!({"model":"p/gpt-old","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .unwrap();
+        assert!(
+            router
+                .route(request, None, tokio_util::sync::CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_catalog_decides_images_when_no_model_settings_do() {
+        let adapter = Arc::new(Listed {
+            catalog: Mutex::new(Some(vec![
+                listed(
+                    "text-only",
+                    1,
+                    serde_json::json!({"supports_vision": false}),
+                ),
+                listed("sees", 1, serde_json::json!({"supports_vision": true})),
+            ])),
+            answer: Some("ok"),
+        });
+        let router = listed_router(
+            serde_json::json!({"auth":{"enabled":false},
+                "providers":{"p":{"kind":"openai-compatible","base_url":"https://example.test/v1"}},
+                "models":{"p/declared":{"capabilities":{"text":true,"streaming":true,"images":true}}}}),
+            adapter.clone(),
+        );
+        refresh(&router).await;
+        let picture = |model: &str| -> router_protocol::ChatCompletionRequest {
+            serde_json::from_value(
+                serde_json::json!({"model": model, "messages":[{"role":"user","content":[
+                    {"type":"text","text":"what is this"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}
+                ]}]}),
+            )
+            .unwrap()
+        };
+        let route = |model: &'static str| {
+            let router = &router;
+            async move {
+                router
+                    .route(
+                        picture(model),
+                        None,
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+            }
+        };
+        let Err(error) = route("p/text-only").await else {
+            panic!("a text-only model must not be sent images");
+        };
+        assert_eq!(error.body.code, "invalid_request");
+        assert!(
+            error.body.message.contains("missing images"),
+            "{}",
+            error.body.message
+        );
+        // An openai-compatible provider reads no images by default; its
+        // catalog says this model does.
+        assert!(route("p/sees").await.is_ok());
+        // Model settings in the configuration win over the catalog.
+        assert!(route("p/declared").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_retired_model_error_names_models_the_provider_lists() {
+        let adapter = Arc::new(Listed {
+            catalog: Mutex::new(Some(vec![
+                listed("gpt-7", 9, serde_json::json!({})),
+                listed("gpt-7-mini", 8, serde_json::json!({})),
+                listed("o5", 7, serde_json::json!({})),
+                listed("embedder", 1, serde_json::json!({})),
+            ])),
+            answer: None,
+        });
+        let router = listed_router(
+            serde_json::json!({"auth":{"enabled":false},
+                "providers":{"p":{"kind":"openai-compatible","base_url":"https://example.test/v1"}}}),
+            adapter.clone(),
+        );
+        let ask = |model: &str| -> router_protocol::ChatCompletionRequest {
+            serde_json::from_value(
+                serde_json::json!({"model": model, "messages":[{"role":"user","content":"hi"}]}),
+            )
+            .unwrap()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new;
+        // Without a catalog the error is as the provider gave it.
+        let Err(error) = router.route(ask("p/gpt-6"), None, cancel()).await else {
+            panic!("the provider refuses every model");
+        };
+        assert_eq!(
+            error.body.message,
+            "upstream returned HTTP 404 (model_not_found)"
+        );
+        refresh(&router).await;
+        let Err(error) = router.route(ask("p/gpt-6"), None, cancel()).await else {
+            panic!("the provider refuses every model");
+        };
+        assert_eq!(error.status, http::StatusCode::NOT_FOUND);
+        assert_eq!(error.body.code, "upstream_404");
+        assert_eq!(error.body.kind, "upstream_error");
+        assert_eq!(
+            error.body.message,
+            "upstream returned HTTP 404 (model_not_found). p no longer lists gpt-6; try p/gpt-7, p/gpt-7-mini or p/o5."
+        );
+        let Err(error) = router.route(ask("p/gpt-7"), None, cancel()).await else {
+            panic!("the provider refuses every model");
+        };
+        assert!(
+            error
+                .body
+                .message
+                .ends_with("p would not serve gpt-7; try p/gpt-7-mini, p/o5 or p/embedder."),
+            "{}",
+            error.body.message
         );
     }
 
