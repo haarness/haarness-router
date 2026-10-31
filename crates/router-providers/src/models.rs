@@ -195,6 +195,28 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
     if config.kind.is_native_openai() && !openai_chat_model(id) {
         return None;
     }
+    // OpenRouter lists batch-only variants (no chat route in `endpoints`)
+    // and image and audio generators beside its chat models; its routers
+    // (`openrouter/auto`) answer chats in text.
+    let chat_route = entry["endpoints"].as_array().is_none_or(|routes| {
+        routes.iter().any(|route| {
+            route
+                .as_str()
+                .is_some_and(|route| route.ends_with("/chat/completions"))
+        })
+    });
+    let media_output = !id.starts_with("openrouter/")
+        && entry
+            .pointer("/architecture/output_modalities")
+            .and_then(Value::as_array)
+            .is_some_and(|modalities| {
+                modalities
+                    .iter()
+                    .any(|modality| matches!(modality.as_str(), Some("image" | "audio")))
+            });
+    if !chat_route || media_output {
+        return None;
+    }
     if protocol == ProviderProtocol::GeminiGenerateContent
         && (!(id.starts_with("gemini-") || id.starts_with("gemma-"))
             || [
@@ -570,5 +592,29 @@ mod tests {
             );
         }
         assert!(model_entry(&config, &json!({"name":"models/gemini-embedding-2","supportedGenerationMethods":["embedContent"]})).is_none());
+    }
+
+    #[test]
+    fn openrouter_lists_only_models_that_answer_a_chat() {
+        let config = ProviderConfig {
+            kind: router_core::ProviderKind::OpenaiCompatible,
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            api_key_env: None,
+            auth_header: None,
+            auth_scheme: None,
+            capabilities: None,
+            allow_unknown_fields: false,
+            allow_insecure_http: false,
+            connect_timeout_ms: 5_000,
+            stream_idle_timeout_ms: 60_000,
+            max_error_body_bytes: 4_096,
+        };
+        let kept = |entry: Value| model_entry(&config, &entry).map(|model| model.id);
+        assert!(kept(json!({"id": "x-ai/grok-4.7", "endpoints": ["/api/v1/chat/completions"], "architecture": {"output_modalities": ["text"]}})).is_some());
+        assert!(kept(json!({"id": "z-ai/glm-5.3-flash:batch", "endpoints": []})).is_none());
+        assert!(kept(json!({"id": "google/gemini-3-pro-image", "architecture": {"output_modalities": ["image", "text"]}})).is_none());
+        assert!(kept(json!({"id": "openrouter/auto", "architecture": {"output_modalities": ["text", "image"]}})).is_some());
+        // Other compatible servers list neither field.
+        assert!(kept(json!({"id": "local-model"})).is_some());
     }
 }

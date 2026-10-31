@@ -95,6 +95,17 @@ impl Capabilities {
                 pdf_text_extraction: true,
                 ..Self::default()
             },
+            // DeepSeek V4 thinks at chosen levels (`reasoning_effort`) and its
+            // Flash model reads images; its reasoning text is not opaque.
+            CapabilityProfile::DeepSeek => Self {
+                text: true,
+                streaming: true,
+                images: true,
+                function_tools: true,
+                reasoning: true,
+                pdf_text_extraction: true,
+                ..Self::default()
+            },
             CapabilityProfile::ConservativeOpenAiCompatible => Self {
                 text: true,
                 streaming: true,

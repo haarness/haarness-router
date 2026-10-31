@@ -215,6 +215,9 @@ impl StandardProvider {
     }
 }
 
+/// `OpenRouter`'s OpenAI-compatible endpoint.
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
 /// The providers a router without a configuration file looks for, in the
 /// order it lists them.
 pub const STANDARD_PROVIDERS: &[StandardProvider] = &[
@@ -264,6 +267,11 @@ pub const STANDARD_PROVIDERS: &[StandardProvider] = &[
         key_variables: &["FIREWORKS_API_KEY"],
     },
     StandardProvider {
+        name: "openrouter",
+        kind: ProviderKind::OpenaiCompatible,
+        key_variables: &["OPENROUTER_API_KEY"],
+    },
+    StandardProvider {
         name: "bedrock",
         kind: ProviderKind::AmazonBedrock,
         key_variables: &["AWS_BEARER_TOKEN_BEDROCK"],
@@ -293,6 +301,27 @@ fn environment_document(lookup: impl Fn(&str) -> Option<String>) -> toml::Value 
                 }
             }
             _ => {}
+        }
+        if provider.name == "openrouter" {
+            table.insert("base_url".into(), OPENROUTER_BASE_URL.into());
+            // An openai-compatible kind promises only text and tools;
+            // OpenRouter keeps reasoning, its replay, images and schemas too.
+            let capabilities = Capabilities {
+                text: true,
+                streaming: true,
+                images: true,
+                function_tools: true,
+                parallel_tools: true,
+                structured_outputs: true,
+                reasoning: true,
+                opaque_reasoning: true,
+                pdf_text_extraction: true,
+                ..Capabilities::default()
+            };
+            table.insert(
+                "capabilities".into(),
+                toml::Value::try_from(capabilities).expect("capabilities serialize"),
+            );
         }
         providers.insert(provider.name.into(), toml::Value::Table(table));
     }
@@ -478,6 +507,7 @@ pub(crate) enum CapabilityProfile {
     OpenAi,
     Anthropic,
     Gemini,
+    DeepSeek,
     ConservativeOpenAiCompatible,
 }
 
@@ -523,7 +553,7 @@ impl ProviderKind {
             },
             Self::Deepseek => ProviderDescriptor {
                 protocol: ProviderProtocol::OpenAiChatCompletions,
-                capability_profile: CapabilityProfile::ConservativeOpenAiCompatible,
+                capability_profile: CapabilityProfile::DeepSeek,
                 default_base_url: Some("https://api.deepseek.com"),
             },
             Self::Together => ProviderDescriptor {
@@ -613,6 +643,17 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// Whether this provider takes back reasoning from any vendor: `OpenRouter`
+    /// passes each model's reasoning to the vendor that made it, so a chat's
+    /// Claude or Gemini reasoning from `OpenRouter` goes back through it.
+    #[must_use]
+    pub fn serves_every_reasoning_format(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .and_then(|base| Url::parse(base).ok())
+            .is_some_and(|url| url.host_str() == Some("openrouter.ai"))
+    }
+
     pub fn effective_base_url(&self) -> Result<String, RouterError> {
         self.base_url
             .clone()
@@ -855,6 +896,34 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_thinks_and_reads_images() {
+        let config = environment_config(&[("DEEPSEEK_API_KEY", "x")]);
+        let capabilities = config.providers["deepseek"].effective_capabilities();
+        assert!(capabilities.reasoning && capabilities.images && capabilities.function_tools);
+        assert!(!capabilities.opaque_reasoning);
+    }
+
+    #[test]
+    fn an_openrouter_key_adds_openrouter_with_what_it_preserves() {
+        let config = environment_config(&[("OPENROUTER_API_KEY", "x")]);
+        let openrouter = &config.providers["openrouter"];
+        assert_eq!(openrouter.kind, ProviderKind::OpenaiCompatible);
+        assert_eq!(
+            openrouter.api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(
+            openrouter.base_url.as_deref(),
+            Some(super::OPENROUTER_BASE_URL)
+        );
+        let capabilities = openrouter.effective_capabilities();
+        assert!(capabilities.reasoning && capabilities.opaque_reasoning);
+        assert!(
+            capabilities.images && capabilities.function_tools && capabilities.structured_outputs
+        );
+    }
+
+    #[test]
     fn environment_defaults_add_one_provider_per_key_found() {
         let config = environment_config(&[
             ("OPENAI_API_KEY", "x"),
@@ -948,8 +1017,12 @@ mod tests {
     fn standard_providers_have_unique_names_and_valid_defaults() {
         for (index, provider) in STANDARD_PROVIDERS.iter().enumerate() {
             assert!(!provider.key_variables.is_empty(), "{}", provider.name);
+            // Every provider a key turns on has an address, its kind's own or
+            // the one the environment configuration sets (OpenRouter's).
+            let key = provider.key_variables[0];
+            let config = environment_config(&[(key, "x")]);
             assert!(
-                provider.kind.default_base_url().is_some(),
+                config.providers[provider.name].effective_base_url().is_ok(),
                 "{}",
                 provider.name
             );
