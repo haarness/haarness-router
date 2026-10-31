@@ -38,6 +38,7 @@ variables that is set and not empty:
 | `DEEPSEEK_API_KEY` | `deepseek` | `deepseek` |
 | `TOGETHER_API_KEY` | `together` | `together` |
 | `FIREWORKS_API_KEY` | `fireworks` | `fireworks` |
+| `OPENROUTER_API_KEY` | `openrouter` | `openai-compatible` at `https://openrouter.ai/api/v1`, stating that it keeps reasoning, its replay, images and structured outputs; models are called by OpenRouter's whole id, `openrouter/x-ai/grok-4.7` |
 | `AWS_BEARER_TOKEN_BEDROCK` | `bedrock` | `amazon-bedrock`, in the region of `AWS_REGION` or `AWS_DEFAULT_REGION` (default `us-east-1`) |
 
 No models or aliases are declared: `GET /v1/models` lists what each provider's live catalog offers, and any

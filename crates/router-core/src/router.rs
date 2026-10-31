@@ -397,6 +397,7 @@ impl Router {
             }
             if let Some(affinity) = requirements.affinity
                 && runtime.kind.reasoning_affinity() != Some(affinity)
+                && !runtime.config.serves_every_reasoning_format()
             {
                 capability_failures.push(format!("{target}: opaque reasoning requires {affinity}"));
                 continue;
@@ -918,6 +919,76 @@ mod tests {
                 .route(request, None, CancellationToken::new())
                 .await
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_takes_back_reasoning_from_the_vendors_it_serves() {
+        use super::*;
+        struct Answers;
+        #[async_trait]
+        impl ProviderAdapter for Answers {
+            async fn stream(
+                &self,
+                _: &str,
+                _: ChatCompletionRequest,
+                _: crate::Capabilities,
+                _: Option<&SecretString>,
+                _: CancellationToken,
+            ) -> Result<EventStream, RouterError> {
+                Ok(Box::pin(futures::stream::iter([Ok(
+                    ProviderEvent::TextDelta {
+                        index: 0,
+                        text: "ok".into(),
+                    },
+                )])))
+            }
+        }
+        let capabilities = serde_json::json!({"text":true,"streaming":true,"function_tools":true,"reasoning":true,"opaque_reasoning":true});
+        let config: AppConfig = serde_json::from_value(serde_json::json!({"providers":{
+            "openrouter":{"kind":"openai-compatible","base_url":"https://openrouter.ai/api/v1","capabilities":capabilities},
+            "other":{"kind":"openai-compatible","base_url":"https://models.example/v1","capabilities":capabilities}
+        }})).unwrap();
+        let adapter = Arc::new(Answers) as Arc<dyn ProviderAdapter>;
+        let router = Router::with_provider_keys(
+            config,
+            HashMap::from([
+                ("openrouter".into(), adapter.clone()),
+                ("other".into(), adapter),
+            ]),
+            HashMap::from([
+                ("openrouter".into(), SecretString::from("k")),
+                ("other".into(), SecretString::from("k")),
+            ]),
+        )
+        .unwrap();
+        // Gemini's reasoning, as OpenRouter streamed it in an earlier answer.
+        let request = |model: &str| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({"model": model, "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello","reasoning_details":[{"type":"reasoning.encrypted","data":"sig","format":"google-gemini-v1","index":0}]},
+                {"role":"user","content":"again"}
+            ]})).unwrap()
+        };
+        assert!(
+            router
+                .route(
+                    request("openrouter/google/gemini-3.8-flash"),
+                    None,
+                    CancellationToken::new()
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            router
+                .route(
+                    request("other/gemini-3.8-flash"),
+                    None,
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
         );
     }
 
