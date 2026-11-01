@@ -19,7 +19,7 @@
 
 **Haarness Router is one OpenAI-compatible endpoint in front of every model provider you use.** Point any
 OpenAI SDK at it and call OpenAI, Anthropic, Gemini (or Vertex AI), Amazon Bedrock, Groq, Mistral, xAI,
-DeepSeek, Together, Fireworks or any OpenAI-compatible server by name, with aliases and fallback between
+DeepSeek, Together, Fireworks, Z.ai or any OpenAI-compatible server by name, with aliases and fallback between
 them. It is a single stateless Rust binary with a built-in dashboard, and it deliberately has **no billing,
 user database, provider marketplace or prompt storage** — it routes, and that is all.
 

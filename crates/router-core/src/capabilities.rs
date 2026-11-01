@@ -122,8 +122,10 @@ impl Capabilities {
                 ..Self::default()
             },
             // Groq's GPT-OSS and Qwen models think at chosen levels and call
-            // tools, and Qwen reads images; its catalog says which model does what.
-            CapabilityProfile::Groq => Self {
+            // tools, and Qwen reads images; its catalog says which model does
+            // what. Z.ai's GLM models think and call tools, and its Flash
+            // models read images.
+            CapabilityProfile::Groq | CapabilityProfile::Zai => Self {
                 text: true,
                 streaming: true,
                 images: true,

@@ -56,6 +56,10 @@ api_key_env = "TOGETHER_API_KEY"
 kind = "fireworks"
 api_key_env = "FIREWORKS_API_KEY"
 
+[providers.zai]
+kind = "zai"
+api_key_env = "ZAI_API_KEY"
+
 # Custom endpoints must provide base_url. Insecure HTTP is rejected unless
 # allow_insecure_http is explicitly enabled for local testing.
 [providers.local]

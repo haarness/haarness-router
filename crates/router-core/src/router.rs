@@ -537,7 +537,9 @@ impl Router {
                 && runtime.kind.reasoning_affinity() != Some(affinity)
                 && !runtime.config.serves_every_reasoning_format()
             {
-                capability_failures.push(format!("{target}: opaque reasoning requires {affinity}"));
+                capability_failures.push(format!(
+                    "{target} can't continue reasoning that only {affinity} can read"
+                ));
                 continue;
             }
             let capabilities = self
@@ -554,7 +556,14 @@ impl Router {
                 });
             let missing = capabilities.missing(&requirements);
             if !missing.is_empty() {
-                capability_failures.push(format!("{target}: missing {}", missing.join(", ")));
+                capability_failures.push(format!(
+                    "{target} doesn't take {}",
+                    missing
+                        .iter()
+                        .map(|feature| readable_feature(feature))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                ));
                 continue;
             }
             if !request.extra.is_empty() && !runtime.config.allow_unknown_fields {
@@ -716,7 +725,7 @@ impl Router {
         if !capability_failures.is_empty() && last_retryable.is_none() {
             return Err(RouterError::invalid(
                 format!(
-                    "no route can preserve the requested features: {}",
+                    "No model can take this request: {}.",
                     capability_failures.join("; ")
                 ),
                 "model",
@@ -996,6 +1005,22 @@ fn unix_time() -> u64 {
         .as_secs()
 }
 
+/// A capability as a person reads it, for refusals.
+fn readable_feature(feature: &str) -> &str {
+    match feature {
+        "input_audio" => "audio",
+        "pdf_or_pdf_text_extraction" => "PDF files",
+        "function_tools" => "tools",
+        "custom_tools" => "custom tools",
+        "parallel_tools" => "parallel tool calls",
+        "structured_outputs" => "a JSON schema for its answer",
+        "opaque_reasoning" => "reasoning carried over from another provider",
+        "logprobs" => "log probabilities",
+        "multiple_choices" => "several answers at once",
+        "audio_output" => "spoken answers",
+        other => other,
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1433,7 +1458,8 @@ mod tests {
         };
         assert_eq!(error.body.code, "invalid_request");
         assert!(
-            error.body.message.contains("missing images"),
+            error.body.message
+                == "No model can take this request: p/text-only doesn't take images.",
             "{}",
             error.body.message
         );

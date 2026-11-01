@@ -16,6 +16,7 @@ A provider's `kind` selects its wire protocol, default base URL and default capa
 | `deepseek` | OpenAI-compatible | `https://api.deepseek.com` |
 | `together` | OpenAI-compatible | `https://api.together.ai/v1` |
 | `fireworks` | OpenAI-compatible | `https://api.fireworks.ai/inference/v1` |
+| `zai` | OpenAI-compatible | `https://api.z.ai/api/paas/v4` |
 | `openai-compatible` | OpenAI-compatible | none: `base_url` is required |
 
 OpenAI-compatible kinds share one transport and SSE implementation, but each keeps its own capabilities, so
@@ -48,6 +49,16 @@ moves to the nearest one the model takes, so `none` on Large 4 is sent as `low`.
 takes `reasoning` on a replayed assistant message but refuses `reasoning_content` and `reasoning_details`, so
 those are sent as `reasoning` or left out. GPT-OSS takes `reasoning_effort` `low`, `medium` and `high` (`none`
 is sent as `low`), and Qwen also takes `none`.
+
+### Z.ai
+
+`zai` calls Z.ai's GLM models. Its catalog names models only, so each listed model says what the router knows:
+every GLM model calls tools and thinks, and only the Flash models (`glm-5.3-flash`, `glm-5.3-flashx`) read
+images; another model sent an image is refused in plain words. GLM answers with `reasoning_content`, and
+continues its thinking across tool calls from the same field, so a replayed `reasoning` is sent as
+`reasoning_content`. GLM-5.3 and its Flash models always think and take `reasoning_effort` `low`, `high` and
+`max` (`none` is sent as `low`, `medium` as `high`); GLM-5.2 takes every level. Earlier GLM models ignore
+`reasoning_effort` and are switched with `thinking.type`: `none` turns thinking off and any other level on.
 
 ### Vertex AI
 
@@ -117,7 +128,7 @@ Capability fields are:
 | Anthropic | `anthropic` | text, streaming, images, PDF, PDF text extraction, function and parallel tools, structured outputs, reasoning, opaque reasoning |
 | Gemini | `gemini` | text, streaming, images, input audio, PDF, PDF text extraction, video, function and parallel tools, structured outputs, reasoning, opaque reasoning |
 | Mistral | `mistral` | text, streaming, images, PDF text extraction, function and parallel tools, structured outputs, reasoning |
-| Groq | `groq` | text, streaming, images, PDF text extraction, function and parallel tools, reasoning |
+| Groq, Z.ai | `groq`, `zai` | text, streaming, images, PDF text extraction, function and parallel tools, reasoning |
 | Conservative | every other kind | text, streaming, function tools, PDF text extraction |
 
 A `capabilities` object on a provider or a model **replaces** the defaults rather than adding to them, so

@@ -281,32 +281,71 @@ pub(crate) fn compatible_reasoning_efforts(
         }
         ProviderKind::Groq if model.starts_with("openai/gpt-oss") => &["low", "medium", "high"],
         ProviderKind::Groq if model.starts_with("qwen/qwen3") => &["none", "low", "medium", "high"],
+        // GLM-5.3 and its Flash models always think; GLM-5.2 takes every level.
+        ProviderKind::Zai if model.starts_with("glm-5.3") => &["low", "high", "max"],
+        ProviderKind::Zai if model.starts_with("glm-5.2") => {
+            &["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        }
+        // Earlier GLM models ignore `reasoning_effort` and think or not.
+        ProviderKind::Zai if model.starts_with("glm-") => &["none", "high"],
         _ => &[],
     }
 }
 
-/// What a provider's Chat Completions refuses that others take. Mistral
-/// refuses any reasoning field on an assistant message (422), and Groq takes
-/// `reasoning` but refuses `reasoning_content` and `reasoning_details` (400),
-/// although clients replay what this router answered. A requested
-/// `reasoning_effort` moves to the nearest level the model takes.
+/// What a provider's Chat Completions refuses or needs that others do not.
+/// Mistral refuses any reasoning field on an assistant message (422), and
+/// Groq takes `reasoning` but refuses `reasoning_content` and
+/// `reasoning_details` (400), although clients replay what this router
+/// answered. Z.ai continues a model's thinking from `reasoning_content`, so a
+/// replayed `reasoning` goes there. A requested `reasoning_effort` moves to
+/// the nearest level the model takes; GLM models before 5.2 ignore it and
+/// switch thinking with `thinking.type` instead.
 fn prepare_for_kind(kind: ProviderKind, model: &str, request: &mut ChatCompletionRequest) {
-    if !matches!(kind, ProviderKind::Mistral | ProviderKind::Groq) {
+    if !matches!(
+        kind,
+        ProviderKind::Mistral | ProviderKind::Groq | ProviderKind::Zai
+    ) {
         return;
     }
     for message in &mut request.messages {
-        let content = message.reasoning_content.take();
         message.reasoning_details.clear();
-        if kind == ProviderKind::Mistral {
-            message.reasoning = None;
-        } else if message.reasoning.is_none() {
-            message.reasoning = content;
+        match kind {
+            ProviderKind::Mistral => {
+                message.reasoning = None;
+                message.reasoning_content = None;
+            }
+            ProviderKind::Groq => {
+                let content = message.reasoning_content.take();
+                if message.reasoning.is_none() {
+                    message.reasoning = content;
+                }
+            }
+            _ => {
+                let reasoning = message.reasoning.take();
+                if message.reasoning_content.is_none() {
+                    message.reasoning_content = reasoning;
+                }
+            }
         }
     }
     let levels = compatible_reasoning_efforts(kind, model);
     if let Some(effort) = request.reasoning_effort.as_mut() {
         let nearest = crate::models::nearest_effort(effort, levels).to_owned();
         *effort = nearest;
+    }
+    if kind == ProviderKind::Zai
+        && levels == ["none", "high"]
+        && let Some(effort) = request.reasoning_effort.take()
+    {
+        let switch = if effort == "none" {
+            "disabled"
+        } else {
+            "enabled"
+        };
+        request
+            .extra
+            .entry("thinking".into())
+            .or_insert_with(|| serde_json::json!({"type": switch}));
     }
 }
 
@@ -424,6 +463,32 @@ mod tests {
             json!({"role": "assistant", "content": "ok", "reasoning": "thought"})
         );
         assert_eq!(sent["reasoning_effort"], "low");
+        // Z.ai continues thinking from `reasoning_content`.
+        let mut glm = request("glm-5.3", "none");
+        glm.messages[1].reasoning_content = None;
+        super::prepare_for_kind(ProviderKind::Zai, "glm-5.3", &mut glm);
+        let sent = serde_json::to_value(&glm).unwrap();
+        assert_eq!(
+            sent["messages"][1],
+            json!({"role": "assistant", "content": "ok", "reasoning_content": "thought"})
+        );
+        // GLM-5.3 always thinks: `none` and `medium` move to its levels.
+        assert_eq!(sent["reasoning_effort"], "low");
+        let mut glm = request("glm-5.3-flash", "medium");
+        super::prepare_for_kind(ProviderKind::Zai, "glm-5.3-flash", &mut glm);
+        assert_eq!(glm.reasoning_effort.as_deref(), Some("high"));
+        let mut glm = request("glm-5.2", "none");
+        super::prepare_for_kind(ProviderKind::Zai, "glm-5.2", &mut glm);
+        assert_eq!(glm.reasoning_effort.as_deref(), Some("none"));
+        assert!(glm.extra.is_empty());
+        // Earlier GLM models switch thinking instead of taking a level.
+        for (effort, switch) in [("none", "disabled"), ("low", "enabled"), ("max", "enabled")] {
+            let mut glm = request("glm-5.1", effort);
+            super::prepare_for_kind(ProviderKind::Zai, "glm-5.1", &mut glm);
+            let sent = serde_json::to_value(&glm).unwrap();
+            assert_eq!(sent["thinking"], json!({"type": switch}), "{effort}");
+            assert!(sent.get("reasoning_effort").is_none());
+        }
         // Other providers get what the client sent.
         let mut deepseek = request("deepseek-v4-flash", "max");
         super::prepare_for_kind(ProviderKind::Deepseek, "deepseek-v4-flash", &mut deepseek);

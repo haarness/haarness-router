@@ -267,6 +267,11 @@ pub const STANDARD_PROVIDERS: &[StandardProvider] = &[
         key_variables: &["FIREWORKS_API_KEY"],
     },
     StandardProvider {
+        name: "zai",
+        kind: ProviderKind::Zai,
+        key_variables: &["ZAI_API_KEY"],
+    },
+    StandardProvider {
         name: "openrouter",
         kind: ProviderKind::OpenaiCompatible,
         key_variables: &["OPENROUTER_API_KEY"],
@@ -484,6 +489,7 @@ pub enum ProviderKind {
     Deepseek,
     Together,
     Fireworks,
+    Zai,
     OpenaiCompatible,
     AmazonBedrock,
 }
@@ -511,6 +517,7 @@ pub(crate) enum CapabilityProfile {
     Xai,
     Mistral,
     Groq,
+    Zai,
     ConservativeOpenAiCompatible,
 }
 
@@ -568,6 +575,11 @@ impl ProviderKind {
                 protocol: ProviderProtocol::OpenAiChatCompletions,
                 capability_profile: CapabilityProfile::ConservativeOpenAiCompatible,
                 default_base_url: Some("https://api.fireworks.ai/inference/v1"),
+            },
+            Self::Zai => ProviderDescriptor {
+                protocol: ProviderProtocol::OpenAiChatCompletions,
+                capability_profile: CapabilityProfile::Zai,
+                default_base_url: Some("https://api.z.ai/api/paas/v4"),
             },
             Self::AmazonBedrock => ProviderDescriptor {
                 protocol: ProviderProtocol::BedrockConverse,
@@ -1128,6 +1140,7 @@ mod tests {
             ProviderKind::Deepseek,
             ProviderKind::Together,
             ProviderKind::Fireworks,
+            ProviderKind::Zai,
             ProviderKind::OpenaiCompatible,
         ] {
             assert_eq!(profile.protocol(), ProviderProtocol::OpenAiChatCompletions);

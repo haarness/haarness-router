@@ -179,6 +179,17 @@ fn plain_refusal(
         };
         return Some((http::StatusCode::PAYLOAD_TOO_LARGE, message));
     }
+    // A text-only model sent an image or other media (Z.ai: "messages.content.type
+    // is invalid, allowed values: ['text']").
+    if status.as_u16() == 400
+        && lower.contains("content.type is invalid")
+        && lower.contains("['text']")
+    {
+        return Some((
+            status,
+            "This model reads only text. Send the request without the image or file, or choose a model that reads them.".to_owned(),
+        ));
+    }
     match status.as_u16() {
         401 | 403 if lower.contains("api keys are not supported") => Some((
             status,
@@ -299,6 +310,13 @@ mod tests {
                 http::StatusCode::TOO_MANY_REQUESTS,
                 "The provider is rate limiting this key. Try again in 31 seconds.".to_owned()
             )
+        );
+        let zai = r#"{"error":{"code":"1214","message":"messages.content.type is invalid, allowed values: ['text']"}}"#;
+        assert!(
+            plain_refusal(http::StatusCode::BAD_REQUEST, zai, None)
+                .unwrap()
+                .1
+                .starts_with("This model reads only text.")
         );
         assert!(plain_refusal(http::StatusCode::NOT_FOUND, "{}", None).is_none());
         assert!(plain_refusal(http::StatusCode::BAD_REQUEST, groq, None).is_none());

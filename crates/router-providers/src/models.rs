@@ -423,6 +423,13 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
         }
         copy(entry, "max_context_length", &mut metadata, "context_window");
         known_efforts(config, id, &mut metadata);
+    } else if config.kind == ProviderKind::Zai {
+        // Z.ai's catalog names its models and nothing more. Every GLM chat
+        // model calls tools and thinks; only the Flash models read images.
+        metadata.insert("supports_tools".into(), json!(true));
+        metadata.insert("supports_reasoning".into(), json!(true));
+        metadata.insert("supports_vision".into(), json!(id.contains("-flash")));
+        known_efforts(config, id, &mut metadata);
     } else if config.kind == ProviderKind::Groq {
         // Groq lists speech (`orpheus`), transcription (`whisper`) and
         // prompt-classifier models beside its chat models.
@@ -1004,6 +1011,29 @@ mod tests {
                 "{id}"
             );
         }
+        let zai = config("zai");
+        // Z.ai lists ids only, as `{"id":"glm-5.3","object":"model","owned_by":"z-ai"}`.
+        let glm = |id: &str| {
+            model_entry(
+                &zai,
+                &json!({"id": id, "object": "model", "owned_by": "z-ai"}),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            glm("glm-5.3").metadata["reasoning_efforts"],
+            json!(["low", "high", "max"])
+        );
+        assert_eq!(glm("glm-5.3").metadata["supports_vision"], json!(false));
+        assert_eq!(
+            glm("glm-5.3-flashx").metadata["supports_vision"],
+            json!(true)
+        );
+        assert_eq!(
+            glm("glm-4.7").metadata["reasoning_efforts"],
+            json!(["none", "high"])
+        );
+        assert_eq!(glm("glm-4.7").metadata["supports_tools"], json!(true));
         let groq = config("groq");
         let entry = |id: &str, input: &[&str], output: &str, features: Value| {
             json!({"id": id, "input_modalities": input, "output_modalities": [output],

@@ -27,8 +27,8 @@ name is everything before the first `/`, and the rest is sent upstream unchanged
   its provider's default capabilities. This is how newly released models work without a configuration
   change.
 - An alias tries its targets in order. Targets that cannot serve the request (for example, images to a
-  text-only model) are skipped before any upstream call; if none can, the request fails with `400` "no
-  route can preserve the requested features", naming what each target lacks.
+  text-only model) are skipped before any upstream call; if none can, the request fails with `400` "No
+  model can take this request", saying what each target does not take.
 - Fallback to the next target happens only for a connection failure, `408`, `429` or `5xx` **before the
   first event** reached the client. A stream that has started is never retried.
 - Each target has a circuit breaker: three failures open it for 30 seconds, then one probe request decides
