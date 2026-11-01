@@ -1321,6 +1321,94 @@ async fn vertex_api_keys_go_in_the_google_key_header_even_where_bearer_is_config
     server.abort();
 }
 
+#[tokio::test]
+async fn provider_refusals_reach_the_caller_in_plain_words_with_its_wait() {
+    async fn refuse(Json(body): Json<serde_json::Value>) -> Response {
+        let (status, retry, text) = match body["model"].as_str().unwrap_or_default() {
+            "busy" => (
+                429,
+                Some("31"),
+                r#"{"message":"Requests rate limit exceeded"}"#,
+            ),
+            "big" => (
+                413,
+                Some("7"),
+                r#"{"error":{"message":"Request too large for model `big` in organization `org_private` on tokens per minute (TPM): Limit 8000, Requested 12082, please reduce your message size and try again.","type":"tokens","code":"rate_limit_exceeded"}}"#,
+            ),
+            _ => (401, None, r#"{"detail":"Invalid API Key"}"#),
+        };
+        let mut response = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(retry) = retry {
+            response = response.header(header::RETRY_AFTER, retry);
+        }
+        response.body(Body::from(text)).unwrap()
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            AxumRouter::new().route("/chat/completions", post(refuse)),
+        )
+        .await
+        .unwrap();
+    });
+    let config = config(BTreeMap::from([(
+        "mistral".into(),
+        native_provider(ProviderKind::Mistral, format!("http://{addr}")),
+    )]));
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(config, adapters, HashMap::new()).unwrap();
+    let app = router_server::app(router_server::AppState::new(
+        router,
+        AuthStore::from_keys(["router-secret"], true),
+    ));
+    for (model, status, retry, message) in [
+        (
+            "busy",
+            429,
+            Some("31"),
+            "The provider is rate limiting this key. Try again in 31 seconds.",
+        ),
+        (
+            "big",
+            413,
+            None,
+            "This request needs 12082 tokens, more than the 8000 tokens a minute the provider's plan allows, so the provider refused it. Send a shorter request, raise the plan's limit, or use another provider.",
+        ),
+        (
+            "bogus",
+            401,
+            None,
+            "The provider refused the API key. Check the key, or replace it.",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_chat_request(serde_json::json!({"model":format!("mistral/{model}"),"messages":[{"role":"user","content":"hello"}]})))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status, "{model}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap().to_owned())
+                .as_deref(),
+            retry,
+            "{model}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["message"], message, "{model}");
+        assert!(!body.to_string().contains("org_private"));
+    }
+    server.abort();
+}
+
 /// Records every upstream request's headers and answers by upstream model:
 /// `fail-500`, `fail-400`, `slow` (no headers for 2 s), `mid-stream-error`
 /// (one chunk, then an error event), or a normal stream. Every response

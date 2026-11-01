@@ -31,6 +31,24 @@ the image and video generators in `/models` stay out, and so do the multi-agent 
 on its Responses API. Each listed model says whether it reads images, whether it reasons and at which
 `reasoning_effort` levels. A model that reasons at a fixed depth (an id ending in `-reasoning`) lists no levels.
 
+### Mistral
+
+`mistral` lists only the models Mistral marks as chat models; its embedding, OCR, moderation, speech and
+transcription models stay out. Each listed model says whether it calls tools, reads images and reasons, and its
+context length. Mistral's thinking models answer with typed content (`thinking` and `text` chunks): the thinking
+arrives as reasoning and the text as the answer. Mistral refuses reasoning fields on an assistant message, so a
+replayed `reasoning`, `reasoning_content` or `reasoning_details` is left out of what it is sent. Large 4 takes
+`reasoning_effort` `low`, `medium` and `high`, and Small 4 and Medium take `none` and `high`; another level
+moves to the nearest one the model takes, so `none` on Large 4 is sent as `low`.
+
+### Groq
+
+`groq` lists its chat models; the speech (`orpheus`), transcription (`whisper`) and prompt-classifier
+(`prompt-guard`) models stay out. Each listed model says whether it calls tools, reads images and reasons. Groq
+takes `reasoning` on a replayed assistant message but refuses `reasoning_content` and `reasoning_details`, so
+those are sent as `reasoning` or left out. GPT-OSS takes `reasoning_effort` `low`, `medium` and `high` (`none`
+is sent as `low`), and Qwen also takes `none`.
+
 ### Vertex AI
 
 Use `kind = "gemini"` with a Vertex AI publisher URL. With a Vertex AI API key (`AIza…`, or `AQ.…` for a key
@@ -98,6 +116,8 @@ Capability fields are:
 | OpenAI | `openai` | text, streaming, images, input audio, PDF text extraction, function, custom and parallel tools, structured outputs, reasoning, opaque reasoning, logprobs, seed, multiple choices, audio output |
 | Anthropic | `anthropic` | text, streaming, images, PDF, PDF text extraction, function and parallel tools, structured outputs, reasoning, opaque reasoning |
 | Gemini | `gemini` | text, streaming, images, input audio, PDF, PDF text extraction, video, function and parallel tools, structured outputs, reasoning, opaque reasoning |
+| Mistral | `mistral` | text, streaming, images, PDF text extraction, function and parallel tools, structured outputs, reasoning |
+| Groq | `groq` | text, streaming, images, PDF text extraction, function and parallel tools, reasoning |
 | Conservative | every other kind | text, streaming, function tools, PDF text extraction |
 
 A `capabilities` object on a provider or a model **replaces** the defaults rather than adding to them, so

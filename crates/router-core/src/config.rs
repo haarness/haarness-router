@@ -509,6 +509,8 @@ pub(crate) enum CapabilityProfile {
     Gemini,
     DeepSeek,
     Xai,
+    Mistral,
+    Groq,
     ConservativeOpenAiCompatible,
 }
 
@@ -539,12 +541,12 @@ impl ProviderKind {
             },
             Self::Groq => ProviderDescriptor {
                 protocol: ProviderProtocol::OpenAiChatCompletions,
-                capability_profile: CapabilityProfile::ConservativeOpenAiCompatible,
+                capability_profile: CapabilityProfile::Groq,
                 default_base_url: Some("https://api.groq.com/openai/v1"),
             },
             Self::Mistral => ProviderDescriptor {
                 protocol: ProviderProtocol::OpenAiChatCompletions,
-                capability_profile: CapabilityProfile::ConservativeOpenAiCompatible,
+                capability_profile: CapabilityProfile::Mistral,
                 default_base_url: Some("https://api.mistral.ai/v1"),
             },
             Self::Xai => ProviderDescriptor {

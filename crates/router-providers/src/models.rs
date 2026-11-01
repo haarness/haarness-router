@@ -406,6 +406,49 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
             .or_insert(json!(efforts));
         copy(entry, "context_length", &mut metadata, "context_window");
         metadata.insert("supports_tools".into(), json!(true));
+    } else if config.kind == ProviderKind::Mistral {
+        // Mistral lists embeddings, OCR, moderation, speech and transcription
+        // beside its chat models, and says which is which.
+        if entry.pointer("/capabilities/completion_chat") == Some(&json!(false)) {
+            return None;
+        }
+        for (from, to) in [
+            ("/capabilities/function_calling", "supports_tools"),
+            ("/capabilities/vision", "supports_vision"),
+            ("/capabilities/reasoning", "supports_reasoning"),
+        ] {
+            if let Some(value) = entry.pointer(from).filter(|value| value.is_boolean()) {
+                metadata.insert(to.into(), value.clone());
+            }
+        }
+        copy(entry, "max_context_length", &mut metadata, "context_window");
+        known_efforts(config, id, &mut metadata);
+    } else if config.kind == ProviderKind::Groq {
+        // Groq lists speech (`orpheus`), transcription (`whisper`) and
+        // prompt-classifier models beside its chat models.
+        let speaks_text = entry["output_modalities"]
+            .as_array()
+            .is_none_or(|outputs| outputs.iter().any(|output| output == "text"));
+        if !speaks_text || id.contains("prompt-guard") {
+            return None;
+        }
+        let features = entry["supported_features"].as_array();
+        let has = |feature: &str| features.is_some_and(|all| all.iter().any(|f| f == feature));
+        metadata.insert("supports_tools".into(), json!(has("tools")));
+        metadata.insert("supports_reasoning".into(), json!(has("reasoning")));
+        if let Some(inputs) = entry["input_modalities"].as_array() {
+            metadata.insert(
+                "supports_vision".into(),
+                json!(inputs.iter().any(|input| input == "image")),
+            );
+        }
+        copy(
+            entry,
+            "max_completion_tokens",
+            &mut metadata,
+            "max_output_tokens",
+        );
+        known_efforts(config, id, &mut metadata);
     } else if config.kind.is_native_openai() {
         let efforts = openai_reasoning_efforts(id);
         let supports_reasoning = metadata
@@ -445,6 +488,16 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
         owned_by: String::new(),
         metadata,
     })
+}
+
+/// The levels a thinking model takes, where the router knows them.
+fn known_efforts(config: &ProviderConfig, id: &str, metadata: &mut BTreeMap<String, Value>) {
+    let efforts = crate::openai_compatible::compatible_reasoning_efforts(config.kind, id);
+    if metadata.get("supports_reasoning") == Some(&json!(true)) && !efforts.is_empty() {
+        metadata
+            .entry("reasoning_efforts".into())
+            .or_insert(json!(efforts));
+    }
 }
 
 fn copy(entry: &Value, from: &str, metadata: &mut BTreeMap<String, Value>, to: &str) {
@@ -915,6 +968,92 @@ mod tests {
             );
         }
         assert!(model_entry(&config, &json!({"name":"models/gemini-embedding-2","supportedGenerationMethods":["embedContent"]})).is_none());
+    }
+
+    #[test]
+    fn mistral_and_groq_list_only_chat_models_with_what_each_can_do() {
+        let config =
+            |kind| -> ProviderConfig { serde_json::from_value(json!({"kind": kind})).unwrap() };
+        let mistral = config("mistral");
+        // Entries as Mistral's `/models` lists them.
+        let entry = |id: &str, chat: bool, reasoning: bool| {
+            json!({"id": id, "name": "mistral-large-4", "max_context_length": 1_048_576,
+                "capabilities": {"completion_chat": chat, "function_calling": chat, "vision": chat, "reasoning": reasoning}})
+        };
+        let large = model_entry(&mistral, &entry("mistral-large-4-0", true, true)).unwrap();
+        assert_eq!(
+            large.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
+        assert_eq!(large.metadata["supports_vision"], json!(true));
+        assert_eq!(large.metadata["supports_tools"], json!(true));
+        assert_eq!(large.metadata["context_window"], json!(1_048_576));
+        assert!(!large.metadata.contains_key("name"));
+        let small = model_entry(&mistral, &entry("mistral-small-latest", true, true)).unwrap();
+        assert_eq!(small.metadata["reasoning_efforts"], json!(["none", "high"]));
+        let plain = model_entry(&mistral, &entry("ministral-8b-latest", true, false)).unwrap();
+        assert_eq!(plain.metadata["reasoning_efforts"], json!([]));
+        for id in [
+            "mistral-embed",
+            "mistral-ocr-latest",
+            "voxtral-mini-tts-latest",
+            "mistral-moderation-2603",
+        ] {
+            assert!(
+                model_entry(&mistral, &entry(id, false, false)).is_none(),
+                "{id}"
+            );
+        }
+        let groq = config("groq");
+        let entry = |id: &str, input: &[&str], output: &str, features: Value| {
+            json!({"id": id, "input_modalities": input, "output_modalities": [output],
+                "supported_features": features, "max_completion_tokens": 65_536})
+        };
+        let oss = model_entry(
+            &groq,
+            &entry(
+                "openai/gpt-oss-120b",
+                &["text"],
+                "text",
+                json!(["tools", "reasoning"]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(oss.metadata["supports_reasoning"], json!(true));
+        assert_eq!(
+            oss.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
+        assert_eq!(oss.metadata["supports_vision"], json!(false));
+        assert_eq!(oss.metadata["max_output_tokens"], json!(65_536));
+        let qwen = model_entry(
+            &groq,
+            &entry(
+                "qwen/qwen3.8-27b",
+                &["text", "image"],
+                "text",
+                json!(["tools", "reasoning"]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(qwen.metadata["supports_vision"], json!(true));
+        let allam = model_entry(
+            &groq,
+            &entry("allam-2-7b", &["text"], "text", json!(["json_mode"])),
+        )
+        .unwrap();
+        assert_eq!(allam.metadata["supports_tools"], json!(false));
+        assert_eq!(allam.metadata["reasoning_efforts"], json!([]));
+        for (id, input, output) in [
+            ("whisper-large-v3-turbo", "audio", "transcription"),
+            ("canopylabs/orpheus-v1-english", "text", "speech"),
+            ("meta-llama/llama-prompt-guard-2-86m", "text", "text"),
+        ] {
+            assert!(
+                model_entry(&groq, &entry(id, &[input], output, Value::Null)).is_none(),
+                "{id}"
+            );
+        }
     }
 
     #[test]

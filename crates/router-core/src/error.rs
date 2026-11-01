@@ -17,6 +17,10 @@ pub struct RouterError {
     /// The provider's own request ID for the failed call. Logged, never sent;
     /// boxed so the `Err` of nearly every result stays small.
     pub upstream_request_id: Option<Box<str>>,
+    /// How many seconds the provider asked callers to wait (its
+    /// `Retry-After`, at most about 18 hours), sent on as this response's own
+    /// `Retry-After`. Two bytes keep the `Err` of nearly every result small.
+    pub retry_after_secs: Option<std::num::NonZeroU16>,
 }
 
 impl RouterError {
@@ -39,6 +43,7 @@ impl RouterError {
             ambiguous: false,
             upstream_failure: None,
             upstream_request_id: None,
+            retry_after_secs: None,
         }
     }
 
@@ -81,6 +86,7 @@ impl RouterError {
             ambiguous: false,
             upstream_failure: None,
             upstream_request_id: None,
+            retry_after_secs: None,
         }
     }
 
@@ -98,6 +104,7 @@ impl RouterError {
             ambiguous,
             upstream_failure: None,
             upstream_request_id: None,
+            retry_after_secs: None,
         }
     }
 
@@ -126,6 +133,12 @@ impl RouterError {
     pub fn with_upstream_failure(mut self, failure: UpstreamFailure) -> Self {
         self.upstream_failure = Some(failure);
         self
+    }
+
+    /// The `Retry-After` header value for this error's response, in whole seconds.
+    #[must_use]
+    pub fn retry_after_header(&self) -> Option<String> {
+        self.retry_after_secs.map(|wait| wait.to_string())
     }
 
     #[must_use]

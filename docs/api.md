@@ -103,9 +103,13 @@ Errors use the OpenAI envelope:
 ```
 
 An upstream HTTP error keeps its status and gets the code `upstream_<status>` (for example
-`upstream_429`). Its message names at most the provider's machine-readable error type, such as
-`upstream returned HTTP 429 (rate_limit_error)`: the provider's own message and body are never passed on,
-because they can echo prompts or credentials. When a provider refuses a model as unknown (a 404 or a
+`upstream_429`). The provider's own message and body are never passed on, because they can echo prompts or
+credentials. Refusals a caller can act on are said in the router's words: a refused key (401 or 403), a
+Vertex AI endpoint that takes only keys bound to a service account, a rate limit (429, with the provider's
+`Retry-After` passed on as the response's own), and a request larger than the plan's tokens a minute, which
+becomes `413 upstream_413` with the request's size and the limit, since waiting never clears it. Any other
+message names at most the provider's machine-readable error type, such as
+`upstream returned HTTP 400 (invalid_request_error)`. When a provider refuses a model as unknown (a 404 or a
 `model_not_found` type) and its catalog has been read, the message goes on to name up to three models it
 lists now, closest names first, for example `upstream returned HTTP 404 (model_not_found). openai no longer
 lists gpt-6; try openai/gpt-7, openai/gpt-7-mini or openai/o5.` Status and code stay the same. Transport
