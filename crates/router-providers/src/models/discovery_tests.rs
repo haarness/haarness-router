@@ -72,10 +72,65 @@ fn provider_catalogue_endpoints_use_the_control_plane() {
         );
     }
     let config = serde_json::from_value(json!({"kind":"gemini","auth_header":"authorization","base_url":"https://aiplatform.googleapis.com/v1/projects/example/locations/global/publishers/google"})).unwrap();
+    let token = SecretString::from("ya29.access-token");
     assert_eq!(
-        vertex_catalog_url(&config).unwrap().as_str(),
+        vertex_catalog_url(&config, &token).unwrap().as_str(),
         "https://aiplatform.googleapis.com/v1beta1/publishers/google/models"
     );
+    // Model Garden refuses API keys, so a key never reads it.
+    assert!(vertex_catalog_url(&config, &SecretString::from("AQ.bound-key")).is_none());
+}
+
+#[tokio::test]
+async fn vertex_with_an_api_key_lists_the_models_its_project_reaches() {
+    let (url, requests, task) = fixture(|path| match path {
+        "/v1/publishers/google/models/gemini-4-argon:countTokens"
+        | "/v1/publishers/google/models/gemini-3.8-flash:countTokens" => {
+            (200, json!({"totalTokens":1}))
+        }
+        _ => (404, json!({"error":{"code":404}})),
+    })
+    .await;
+    // Both a key-only setup and one still marked for access tokens send the key as a key.
+    for auth_header in [None, Some("authorization")] {
+        requests.lock().unwrap().clear();
+        let config: ProviderConfig = serde_json::from_value(json!({"kind":"gemini","auth_header":auth_header,"base_url":format!("{url}/v1/publishers/google"),"allow_insecure_http":true})).unwrap();
+        let models = crate::build_adapters(&router_core::AppConfig {
+            providers: [("customer".into(), config.clone())].into(),
+            models: BTreeMap::default(),
+            aliases: BTreeMap::default(),
+            server: router_core::ServerConfig::default(),
+            auth: router_core::AuthConfig::default(),
+            web_ui: router_core::WebUiConfig::default(),
+        })
+        .unwrap()["customer"]
+            .discover_models(&config, Some(&SecretString::from("AQ.bound-key")))
+            .await
+            .unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gemini-4-argon", "gemini-3.8-flash"]
+        );
+        assert!(models[1].metadata.contains_key("reasoning_efforts"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), VERTEX_KEY_MODELS.len());
+        assert!(requests.iter().all(|r| r.starts_with("POST ")
+            && r.contains("x-goog-api-key: AQ.bound-key\r\n")
+            && !r.contains("authorization")));
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn vertex_with_a_refused_api_key_lists_nothing() {
+    let (url, _, task) = fixture(|_| (401, json!({"error":{"code":401}}))).await;
+    let config: ProviderConfig = serde_json::from_value(json!({"kind":"gemini","base_url":format!("{url}/v1/publishers/google"),"allow_insecure_http":true})).unwrap();
+    assert!(
+        discover(&config, Some(&SecretString::from("AIza-refused")))
+            .await
+            .is_none()
+    );
+    task.abort();
 }
 
 #[tokio::test]

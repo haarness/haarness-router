@@ -194,7 +194,7 @@ serves `work/<model>`.
 | `kind` | required | One of the [built-in kinds](providers.md#built-in-kinds). |
 | `base_url` | the kind's default | Required for `openai-compatible`. Must be HTTPS unless `allow_insecure_http`. |
 | `api_key_env` | unset | Environment variable holding the provider credential. |
-| `auth_header` | `Authorization: Bearer` | A different header for the key, for example `x-api-key`; `authorization` switches Gemini to Bearer tokens (Vertex AI). |
+| `auth_header` | `Authorization: Bearer` | A different header for the key, for example `x-api-key`; `authorization` switches Gemini to Bearer tokens for a Vertex AI access token; a Google API key still goes in `x-goog-api-key`. |
 | `auth_scheme` | unset | A prefix for a custom `auth_header`, for example `Bearer`. |
 | `capabilities` | the kind's defaults | The provider-wide [capability object](providers.md#models-and-capabilities). |
 | `allow_unknown_fields` | `false` | Accept request fields the router does not model for this provider and forward them; native adapters still refuse what they cannot translate. |

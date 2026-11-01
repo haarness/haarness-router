@@ -43,7 +43,10 @@ pub(crate) async fn discover(
     if protocol == ProviderProtocol::BedrockConverse {
         return bedrock::discover(&client, config, key).await;
     }
-    let vertex = vertex_catalog_url(config);
+    if vertex_publisher(config) && crate::gemini::google_api_key(key.expose_secret()) {
+        return vertex_key_models(&client, config, key).await;
+    }
+    let vertex = vertex_catalog_url(config, key);
     // xAI's `/models` mixes its image and video generators in with its chat
     // models and says nothing of their input; `/language-models` lists only
     // the chat models, with their input and reasoning levels.
@@ -88,7 +91,7 @@ pub(crate) async fn discover(
                 .header("x-api-key", key.expose_secret())
                 .header("anthropic-version", "2023-06-01"),
             ProviderProtocol::GeminiGenerateContent => {
-                if config.auth_header.as_deref() == Some("authorization") {
+                if crate::gemini::sends_bearer(config, key.expose_secret()) {
                     request.bearer_auth(key.expose_secret())
                 } else {
                     request.header("x-goog-api-key", key.expose_secret())
@@ -161,24 +164,81 @@ async fn read_json(request: reqwest::RequestBuilder) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn vertex_catalog_url(config: &ProviderConfig) -> Option<url::Url> {
-    if config.kind.protocol() != ProviderProtocol::GeminiGenerateContent
-        || config.auth_header.as_deref() != Some("authorization")
-    {
+/// A Gemini provider whose base URL is a Vertex AI publisher path, with or
+/// without a project: `…/v1/publishers/google` or
+/// `…/v1/projects/<project>/locations/<location>/publishers/google`.
+fn vertex_publisher(config: &ProviderConfig) -> bool {
+    config.kind.protocol() == ProviderProtocol::GeminiGenerateContent
+        && config.effective_base_url().is_ok_and(|base| {
+            url::Url::parse(&base).is_ok_and(|url| {
+                url.path()
+                    .trim_end_matches('/')
+                    .ends_with("/publishers/google")
+            })
+        })
+}
+
+fn vertex_catalog_url(config: &ProviderConfig, key: &SecretString) -> Option<url::Url> {
+    if !vertex_publisher(config) || !crate::gemini::sends_bearer(config, key.expose_secret()) {
         return None;
     }
     let mut url = url::Url::parse(&config.effective_base_url().ok()?).ok()?;
-    if !url
-        .path()
-        .trim_end_matches('/')
-        .ends_with("/publishers/google")
-    {
-        return None;
-    }
     // Model Garden listing is a publisher resource, not a project-scoped inference resource.
     url.set_path("/v1beta1/publishers/google/models");
     url.set_query(None);
     Some(url)
+}
+
+/// Vertex's Model Garden listing takes only OAuth access tokens, so with an
+/// API key the router cannot read the catalog. These are the Gemini chat
+/// models Vertex serves; each is kept only when the key's project reaches it,
+/// which the free `countTokens` call answers. Models missing here can still be
+/// requested by ID.
+const VERTEX_KEY_MODELS: [&str; 12] = [
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+];
+
+async fn vertex_key_models(
+    client: &reqwest::Client,
+    config: &ProviderConfig,
+    key: &SecretString,
+) -> Option<Vec<ModelObject>> {
+    let base = config.effective_base_url().ok()?;
+    let base = base.trim_end_matches('/');
+    let probe = json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]});
+    let found = futures::future::join_all(VERTEX_KEY_MODELS.iter().map(|id| {
+        let request = client
+            .post(format!("{base}/models/{id}:countTokens"))
+            .header("x-goog-api-key", key.expose_secret())
+            .json(&probe);
+        async move {
+            let response = request.send().await.ok()?;
+            response.status().is_success().then_some(*id)
+        }
+    }))
+    .await;
+    let models: Vec<_> = found
+        .into_iter()
+        .flatten()
+        .filter_map(|id| {
+            model_entry(
+                config,
+                &json!({"name":format!("models/{id}"), "displayName":id, "supportedGenerationMethods":["generateContent"]}),
+            )
+        })
+        .collect();
+    (!models.is_empty()).then_some(models)
 }
 
 fn vertex_model(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {

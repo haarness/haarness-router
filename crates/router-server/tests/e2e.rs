@@ -1266,6 +1266,61 @@ async fn vertex_uses_oauth_bearer_without_google_api_key_header() {
     server.abort();
 }
 
+#[tokio::test]
+async fn vertex_api_keys_go_in_the_google_key_header_even_where_bearer_is_configured() {
+    async fn vertex(headers: HeaderMap) -> Response {
+        assert!(headers.get(header::AUTHORIZATION).is_none());
+        let key = headers["x-goog-api-key"].to_str().unwrap().to_owned();
+        Response::builder().header(header::CONTENT_TYPE,"text/event-stream")
+            .body(Body::from(format!("data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"vertex-{key}\"}}]}},\"finishReason\":\"STOP\"}}]}}\n\n"))).unwrap()
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            AxumRouter::new().route("/v1/publishers/google/models/{model}", post(vertex)),
+        )
+        .await
+        .unwrap();
+    });
+    // The global publisher endpoint needs no project: the key belongs to one. A key still goes in
+    // `x-goog-api-key` when the provider was set up for access tokens.
+    for bearer in [false, true] {
+        let mut definition = native_provider(
+            ProviderKind::Gemini,
+            format!("http://{addr}/v1/publishers/google"),
+        );
+        if bearer {
+            definition.auth_header = Some("authorization".into());
+            definition.auth_scheme = Some("Bearer".into());
+        }
+        let config = config(BTreeMap::from([("google-vertex".into(), definition)]));
+        let adapters = router_providers::build_adapters(&config).unwrap();
+        let router = Router::with_provider_keys(config, adapters, HashMap::new()).unwrap();
+        let app = router_server::app(router_server::AppState::new(
+            router,
+            AuthStore::from_keys(["router-secret"], true),
+        ));
+        for key in ["AQ.bound-key", "AIza-classic-key"] {
+            let mut request = json_chat_request(
+                serde_json::json!({"model":"google-vertex/gemini-test","messages":[{"role":"user","content":"hello"}],"max_tokens":10}),
+            );
+            request
+                .headers_mut()
+                .insert("x-upstream-api-key", key.parse().unwrap());
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains(&format!("vertex-{key}")),
+                "{bearer} {key}"
+            );
+        }
+    }
+    server.abort();
+}
+
 /// Records every upstream request's headers and answers by upstream model:
 /// `fail-500`, `fail-400`, `slow` (no headers for 2 s), `mid-stream-error`
 /// (one chunk, then an error event), or a normal stream. Every response

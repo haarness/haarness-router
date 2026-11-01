@@ -126,7 +126,8 @@ A router that has no provider for the request says what to set up instead, with 
 `GET /v1/models` returns the configured aliases and models, plus every provider's own catalog of chat
 models, discovered with the server's provider keys (never the caller's router key or upstream key):
 
-- OpenAI-compatible endpoints, Anthropic, Gemini, Vertex AI and Bedrock catalogs are supported.
+- OpenAI-compatible endpoints, Anthropic, Gemini, Vertex AI and Bedrock catalogs are supported. With a Vertex AI
+  API key, which cannot read Google's catalog, the list is the current Gemini models the key's project can use.
 - Discovery runs when the endpoint is called, at most once every five minutes; simultaneous calls share
   one refresh, and a failed refresh keeps the last complete catalog.
 - Each provider's refresh is bounded to ten seconds, ten pages and 4 MiB per page.

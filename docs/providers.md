@@ -33,8 +33,23 @@ on its Responses API. Each listed model says whether it reads images, whether it
 
 ### Vertex AI
 
-Use `kind = "gemini"` with a Vertex AI publisher URL and `auth_header = "authorization"`, which sends the
-credential as an OAuth Bearer token instead of a Gemini API key:
+Use `kind = "gemini"` with a Vertex AI publisher URL. With a Vertex AI API key (`AIza…`, or `AQ.…` for a key
+bound to a service account), no project is needed: the key already belongs to one, and the global publisher
+endpoint serves it.
+
+```toml
+[providers.vertex]
+kind = "gemini"
+base_url = "https://aiplatform.googleapis.com/v1/publishers/google"
+api_key_env = "GOOGLE_VERTEX_API_KEY"
+```
+
+The key goes in `x-goog-api-key`. Google does not let an API key read the Model Garden catalog, so discovery
+checks a built-in list of current Gemini models with Vertex's free `countTokens` call and lists the ones the
+key's project can use. Any other model can still be requested by its ID.
+
+With an OAuth access token instead, name the project and location and set `auth_header = "authorization"`,
+which sends the token as a Bearer token:
 
 ```toml
 [providers.vertex]
@@ -45,7 +60,9 @@ api_key_env = "VERTEX_ACCESS_TOKEN"
 ```
 
 Model discovery then lists Google's Model Garden chat models. The router reads the token once at startup,
-so a short-lived access token needs a restart before it expires.
+so a short-lived access token needs a restart before it expires; an API key does not expire. A Google API
+key is always sent in `x-goog-api-key`, even under `auth_header = "authorization"`, because Google refuses
+one as a Bearer token.
 
 ### Amazon Bedrock
 
