@@ -2,8 +2,8 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use router_core::{
-    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, ProviderStream,
-    RouterError,
+    Capabilities, EventStream, ProviderAdapter, ProviderConfig, ProviderEvent, ProviderKind,
+    ProviderStream, RouterError,
 };
 use router_protocol::{ChatCompletionRequest, Usage};
 use secrecy::{ExposeSecret, SecretString};
@@ -20,6 +20,7 @@ pub struct OpenAiCompatibleAdapter {
     transport: ProviderTransport,
     endpoint: String,
     native_openai: bool,
+    kind: ProviderKind,
     auth_header: reqwest::header::HeaderName,
     auth_scheme: Option<String>,
 }
@@ -47,6 +48,7 @@ impl OpenAiCompatibleAdapter {
                 config.effective_base_url()?.trim_end_matches('/')
             ),
             native_openai: config.kind.is_native_openai(),
+            kind: config.kind,
             auth_header,
             auth_scheme,
         })
@@ -114,6 +116,7 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 .await;
             }
         }
+        prepare_for_kind(self.kind, model, &mut request);
         request.model = model.to_owned();
         request.stream = true;
         request.stream_options.get_or_insert_default().include_usage = true;
@@ -152,8 +155,21 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                         .and_then(|value| u32::try_from(value).ok())
                         .unwrap_or(0);
                     let delta = choice.get("delta").unwrap_or(&Value::Null);
-                    if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                        yield ProviderEvent::TextDelta { index, text: text.into() };
+                    match delta.get("content") {
+                        Some(Value::String(text)) => {
+                            yield ProviderEvent::TextDelta { index, text: text.clone() };
+                        }
+                        // Mistral's thinking models send content as typed chunks.
+                        Some(Value::Array(chunks)) => {
+                            for (thinking, text) in content_chunks(chunks) {
+                                yield if thinking {
+                                    ProviderEvent::ReasoningDelta { index, text }
+                                } else {
+                                    ProviderEvent::TextDelta { index, text }
+                                };
+                            }
+                        }
+                        _ => {}
                     }
                     let text = delta
                         .get("reasoning")
@@ -210,6 +226,126 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             events,
             upstream_request_id,
         })
+    }
+}
+
+/// Text and thinking from a content array: `{"type":"text","text":…}` and
+/// `{"type":"thinking","thinking":[{"type":"text","text":…}]}` (or a plain
+/// string in `thinking`), in order. `true` marks thinking.
+fn content_chunks(chunks: &[Value]) -> Vec<(bool, String)> {
+    let mut out = Vec::new();
+    for chunk in chunks {
+        match chunk.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = chunk.get("text").and_then(Value::as_str) {
+                    out.push((false, text.to_owned()));
+                }
+            }
+            Some("thinking") => match chunk.get("thinking") {
+                Some(Value::String(text)) => out.push((true, text.clone())),
+                Some(Value::Array(parts)) => {
+                    for part in parts {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            out.push((true, text.to_owned()));
+                        }
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The `reasoning_effort` levels a model takes, where its provider refuses
+/// the others with a 400 and its catalog does not say. Empty: pass through.
+pub(crate) fn compatible_reasoning_efforts(
+    kind: ProviderKind,
+    model: &str,
+) -> &'static [&'static str] {
+    match kind {
+        // Large 4 always thinks; Small 4, Medium and their aliases think or not.
+        ProviderKind::Mistral if model.starts_with("mistral-large-4") => &["low", "medium", "high"],
+        ProviderKind::Mistral
+            if [
+                "mistral-small",
+                "mistral-medium",
+                "magistral-",
+                "mistral-vibe-cli",
+            ]
+            .iter()
+            .any(|family| model.starts_with(family)) =>
+        {
+            &["none", "high"]
+        }
+        ProviderKind::Groq if model.starts_with("openai/gpt-oss") => &["low", "medium", "high"],
+        ProviderKind::Groq if model.starts_with("qwen/qwen3") => &["none", "low", "medium", "high"],
+        // GLM-5.3 and its Flash models always think; GLM-5.2 takes every level.
+        ProviderKind::Zai if model.starts_with("glm-5.3") => &["low", "high", "max"],
+        ProviderKind::Zai if model.starts_with("glm-5.2") => {
+            &["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        }
+        // Earlier GLM models ignore `reasoning_effort` and think or not.
+        ProviderKind::Zai if model.starts_with("glm-") => &["none", "high"],
+        _ => &[],
+    }
+}
+
+/// What a provider's Chat Completions refuses or needs that others do not.
+/// Mistral refuses any reasoning field on an assistant message (422), and
+/// Groq takes `reasoning` but refuses `reasoning_content` and
+/// `reasoning_details` (400), although clients replay what this router
+/// answered. Z.ai continues a model's thinking from `reasoning_content`, so a
+/// replayed `reasoning` goes there. A requested `reasoning_effort` moves to
+/// the nearest level the model takes; GLM models before 5.2 ignore it and
+/// switch thinking with `thinking.type` instead.
+fn prepare_for_kind(kind: ProviderKind, model: &str, request: &mut ChatCompletionRequest) {
+    if !matches!(
+        kind,
+        ProviderKind::Mistral | ProviderKind::Groq | ProviderKind::Zai
+    ) {
+        return;
+    }
+    for message in &mut request.messages {
+        message.reasoning_details.clear();
+        match kind {
+            ProviderKind::Mistral => {
+                message.reasoning = None;
+                message.reasoning_content = None;
+            }
+            ProviderKind::Groq => {
+                let content = message.reasoning_content.take();
+                if message.reasoning.is_none() {
+                    message.reasoning = content;
+                }
+            }
+            _ => {
+                let reasoning = message.reasoning.take();
+                if message.reasoning_content.is_none() {
+                    message.reasoning_content = reasoning;
+                }
+            }
+        }
+    }
+    let levels = compatible_reasoning_efforts(kind, model);
+    if let Some(effort) = request.reasoning_effort.as_mut() {
+        let nearest = crate::models::nearest_effort(effort, levels).to_owned();
+        *effort = nearest;
+    }
+    if kind == ProviderKind::Zai
+        && levels == ["none", "high"]
+        && let Some(effort) = request.reasoning_effort.take()
+    {
+        let switch = if effort == "none" {
+            "disabled"
+        } else {
+            "enabled"
+        };
+        request
+            .extra
+            .entry("thinking".into())
+            .or_insert_with(|| serde_json::json!({"type": switch}));
     }
 }
 
@@ -276,6 +412,92 @@ mod tests {
     use router_protocol::ChatCompletionRequest;
 
     use super::{normalize_finish, normalize_native_openai_request};
+    use router_core::ProviderKind;
+    use serde_json::json;
+
+    #[test]
+    fn content_chunks_split_thinking_from_text() {
+        let chunks = json!([
+            {"type": "thinking", "thinking": [{"type": "text", "text": "Think"}, {"type": "text", "text": "ing."}], "closed": true},
+            {"type": "text", "text": "ok"},
+            {"type": "thinking", "thinking": "More."},
+            {"type": "image_url", "image_url": "ignored"}
+        ]);
+        assert_eq!(
+            super::content_chunks(chunks.as_array().unwrap()),
+            [
+                (true, "Think".to_owned()),
+                (true, "ing.".to_owned()),
+                (false, "ok".to_owned()),
+                (true, "More.".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn mistral_and_groq_get_only_the_reasoning_fields_and_levels_they_take() {
+        let request = |model: &str, effort: &str| -> ChatCompletionRequest {
+            serde_json::from_value(json!({"model": model, "reasoning_effort": effort, "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok", "reasoning": "thought", "reasoning_content": "thought",
+                 "reasoning_details": [{"type": "reasoning.text", "text": "thought"}]}
+            ]})).unwrap()
+        };
+        let mut mistral = request("mistral-small-latest", "medium");
+        super::prepare_for_kind(ProviderKind::Mistral, "mistral-small-latest", &mut mistral);
+        let sent = serde_json::to_value(&mistral).unwrap();
+        assert_eq!(
+            sent["messages"][1],
+            json!({"role": "assistant", "content": "ok"})
+        );
+        assert_eq!(sent["reasoning_effort"], "high");
+        let mut large = request("mistral-large-4-0", "none");
+        super::prepare_for_kind(ProviderKind::Mistral, "mistral-large-4-0", &mut large);
+        assert_eq!(large.reasoning_effort.as_deref(), Some("low"));
+        let mut groq = request("openai/gpt-oss-20b", "none");
+        groq.messages[1].reasoning = None;
+        super::prepare_for_kind(ProviderKind::Groq, "openai/gpt-oss-20b", &mut groq);
+        let sent = serde_json::to_value(&groq).unwrap();
+        assert_eq!(
+            sent["messages"][1],
+            json!({"role": "assistant", "content": "ok", "reasoning": "thought"})
+        );
+        assert_eq!(sent["reasoning_effort"], "low");
+        // Z.ai continues thinking from `reasoning_content`.
+        let mut glm = request("glm-5.3", "none");
+        glm.messages[1].reasoning_content = None;
+        super::prepare_for_kind(ProviderKind::Zai, "glm-5.3", &mut glm);
+        let sent = serde_json::to_value(&glm).unwrap();
+        assert_eq!(
+            sent["messages"][1],
+            json!({"role": "assistant", "content": "ok", "reasoning_content": "thought"})
+        );
+        // GLM-5.3 always thinks: `none` and `medium` move to its levels.
+        assert_eq!(sent["reasoning_effort"], "low");
+        let mut glm = request("glm-5.3-flash", "medium");
+        super::prepare_for_kind(ProviderKind::Zai, "glm-5.3-flash", &mut glm);
+        assert_eq!(glm.reasoning_effort.as_deref(), Some("high"));
+        let mut glm = request("glm-5.2", "none");
+        super::prepare_for_kind(ProviderKind::Zai, "glm-5.2", &mut glm);
+        assert_eq!(glm.reasoning_effort.as_deref(), Some("none"));
+        assert!(glm.extra.is_empty());
+        // Earlier GLM models switch thinking instead of taking a level.
+        for (effort, switch) in [("none", "disabled"), ("low", "enabled"), ("max", "enabled")] {
+            let mut glm = request("glm-5.1", effort);
+            super::prepare_for_kind(ProviderKind::Zai, "glm-5.1", &mut glm);
+            let sent = serde_json::to_value(&glm).unwrap();
+            assert_eq!(sent["thinking"], json!({"type": switch}), "{effort}");
+            assert!(sent.get("reasoning_effort").is_none());
+        }
+        // Other providers get what the client sent.
+        let mut deepseek = request("deepseek-v4-flash", "max");
+        super::prepare_for_kind(ProviderKind::Deepseek, "deepseek-v4-flash", &mut deepseek);
+        assert_eq!(
+            deepseek.messages[1].reasoning_content.as_deref(),
+            Some("thought")
+        );
+        assert_eq!(deepseek.reasoning_effort.as_deref(), Some("max"));
+    }
 
     #[test]
     fn normalizes_provider_finish_reasons() {

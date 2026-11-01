@@ -777,6 +777,9 @@ fn api_error(error: RouterError, request_id: &str) -> Response {
     let status = error.status;
     let mut response = (status, axum::Json(error.envelope())).into_response();
     insert_header(response.headers_mut(), "x-request-id", request_id);
+    if let Some(wait) = error.retry_after_header() {
+        insert_header(response.headers_mut(), "retry-after", &wait);
+    }
     response
 }
 

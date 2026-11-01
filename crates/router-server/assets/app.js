@@ -501,6 +501,7 @@
     deepseek: "DeepSeek",
     together: "Together AI",
     fireworks: "Fireworks AI",
+    zai: "Z.ai",
     "openai-compatible": "OpenAI-compatible",
     "amazon-bedrock": "Amazon Bedrock",
   };

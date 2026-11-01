@@ -27,8 +27,8 @@ name is everything before the first `/`, and the rest is sent upstream unchanged
   its provider's default capabilities. This is how newly released models work without a configuration
   change.
 - An alias tries its targets in order. Targets that cannot serve the request (for example, images to a
-  text-only model) are skipped before any upstream call; if none can, the request fails with `400` "no
-  route can preserve the requested features", naming what each target lacks.
+  text-only model) are skipped before any upstream call; if none can, the request fails with `400` "No
+  model can take this request", saying what each target does not take.
 - Fallback to the next target happens only for a connection failure, `408`, `429` or `5xx` **before the
   first event** reached the client. A stream that has started is never retried.
 - Each target has a circuit breaker: three failures open it for 30 seconds, then one probe request decides
@@ -103,9 +103,13 @@ Errors use the OpenAI envelope:
 ```
 
 An upstream HTTP error keeps its status and gets the code `upstream_<status>` (for example
-`upstream_429`). Its message names at most the provider's machine-readable error type, such as
-`upstream returned HTTP 429 (rate_limit_error)`: the provider's own message and body are never passed on,
-because they can echo prompts or credentials. When a provider refuses a model as unknown (a 404 or a
+`upstream_429`). The provider's own message and body are never passed on, because they can echo prompts or
+credentials. Refusals a caller can act on are said in the router's words: a refused key (401 or 403), a
+Vertex AI endpoint that takes only keys bound to a service account, a rate limit (429, with the provider's
+`Retry-After` passed on as the response's own), and a request larger than the plan's tokens a minute, which
+becomes `413 upstream_413` with the request's size and the limit, since waiting never clears it. Any other
+message names at most the provider's machine-readable error type, such as
+`upstream returned HTTP 400 (invalid_request_error)`. When a provider refuses a model as unknown (a 404 or a
 `model_not_found` type) and its catalog has been read, the message goes on to name up to three models it
 lists now, closest names first, for example `upstream returned HTTP 404 (model_not_found). openai no longer
 lists gpt-6; try openai/gpt-7, openai/gpt-7-mini or openai/o5.` Status and code stay the same. Transport
@@ -126,7 +130,8 @@ A router that has no provider for the request says what to set up instead, with 
 `GET /v1/models` returns the configured aliases and models, plus every provider's own catalog of chat
 models, discovered with the server's provider keys (never the caller's router key or upstream key):
 
-- OpenAI-compatible endpoints, Anthropic, Gemini, Vertex AI and Bedrock catalogs are supported.
+- OpenAI-compatible endpoints, Anthropic, Gemini, Vertex AI and Bedrock catalogs are supported. With a Vertex AI
+  API key, which cannot read Google's catalog, the list is the current Gemini models the key's project can use.
 - Discovery runs when the endpoint is called, at most once every five minutes; simultaneous calls share
   one refresh, and a failed refresh keeps the last complete catalog.
 - Each provider's refresh is bounded to ten seconds, ten pages and 4 MiB per page.

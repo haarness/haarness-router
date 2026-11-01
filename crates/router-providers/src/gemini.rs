@@ -19,9 +19,22 @@ use crate::{
     transport::ProviderTransport,
 };
 
+/// Google API keys (`AIza…`, and `AQ.…` for keys bound to a service account)
+/// travel in `x-goog-api-key`. Google refuses them as a Bearer token, so only
+/// an OAuth access token is ever sent as one, whatever `auth_header` says.
+pub(crate) fn google_api_key(key: &str) -> bool {
+    key.starts_with("AIza") || key.starts_with("AQ.")
+}
+
+/// Whether `key` goes in `Authorization: Bearer` rather than `x-goog-api-key`.
+pub(crate) fn sends_bearer(config: &ProviderConfig, key: &str) -> bool {
+    config.auth_header.as_deref() == Some("authorization") && !google_api_key(key)
+}
+
 pub struct GeminiAdapter {
     transport: ProviderTransport,
     base_url: String,
+    /// `auth_header = "authorization"`: access tokens go as Bearer tokens.
     bearer_auth: bool,
     /// Reasoning levels per model from the last successful catalog read.
     levels: std::sync::RwLock<HashMap<String, Vec<String>>>,
@@ -100,7 +113,7 @@ impl ProviderAdapter for GeminiAdapter {
             self.base_url.trim_end_matches('/')
         );
         let request = self.transport.client().post(url);
-        let request = if self.bearer_auth {
+        let request = if self.bearer_auth && !google_api_key(key.expose_secret()) {
             request.bearer_auth(key.expose_secret())
         } else {
             request.header("x-goog-api-key", key.expose_secret())

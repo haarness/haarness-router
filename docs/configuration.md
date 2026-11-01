@@ -38,6 +38,7 @@ variables that is set and not empty:
 | `DEEPSEEK_API_KEY` | `deepseek` | `deepseek` |
 | `TOGETHER_API_KEY` | `together` | `together` |
 | `FIREWORKS_API_KEY` | `fireworks` | `fireworks` |
+| `ZAI_API_KEY` | `zai` | `zai` |
 | `OPENROUTER_API_KEY` | `openrouter` | `openai-compatible` at `https://openrouter.ai/api/v1`, stating that it keeps reasoning, its replay, images and structured outputs; models are called by OpenRouter's whole id, `openrouter/x-ai/grok-4.7` |
 | `AWS_BEARER_TOKEN_BEDROCK` | `bedrock` | `amazon-bedrock`, in the region of `AWS_REGION` or `AWS_DEFAULT_REGION` (default `us-east-1`) |
 
@@ -194,7 +195,7 @@ serves `work/<model>`.
 | `kind` | required | One of the [built-in kinds](providers.md#built-in-kinds). |
 | `base_url` | the kind's default | Required for `openai-compatible`. Must be HTTPS unless `allow_insecure_http`. |
 | `api_key_env` | unset | Environment variable holding the provider credential. |
-| `auth_header` | `Authorization: Bearer` | A different header for the key, for example `x-api-key`; `authorization` switches Gemini to Bearer tokens (Vertex AI). |
+| `auth_header` | `Authorization: Bearer` | A different header for the key, for example `x-api-key`; `authorization` switches Gemini to Bearer tokens for a Vertex AI access token; a Google API key still goes in `x-goog-api-key`. |
 | `auth_scheme` | unset | A prefix for a custom `auth_header`, for example `Bearer`. |
 | `capabilities` | the kind's defaults | The provider-wide [capability object](providers.md#models-and-capabilities). |
 | `allow_unknown_fields` | `false` | Accept request fields the router does not model for this provider and forward them; native adapters still refuse what they cannot translate. |

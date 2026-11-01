@@ -16,6 +16,7 @@ A provider's `kind` selects its wire protocol, default base URL and default capa
 | `deepseek` | OpenAI-compatible | `https://api.deepseek.com` |
 | `together` | OpenAI-compatible | `https://api.together.ai/v1` |
 | `fireworks` | OpenAI-compatible | `https://api.fireworks.ai/inference/v1` |
+| `zai` | OpenAI-compatible | `https://api.z.ai/api/paas/v4` |
 | `openai-compatible` | OpenAI-compatible | none: `base_url` is required |
 
 OpenAI-compatible kinds share one transport and SSE implementation, but each keeps its own capabilities, so
@@ -31,10 +32,53 @@ the image and video generators in `/models` stay out, and so do the multi-agent 
 on its Responses API. Each listed model says whether it reads images, whether it reasons and at which
 `reasoning_effort` levels. A model that reasons at a fixed depth (an id ending in `-reasoning`) lists no levels.
 
+### Mistral
+
+`mistral` lists only the models Mistral marks as chat models; its embedding, OCR, moderation, speech and
+transcription models stay out. Each listed model says whether it calls tools, reads images and reasons, and its
+context length. Mistral's thinking models answer with typed content (`thinking` and `text` chunks): the thinking
+arrives as reasoning and the text as the answer. Mistral refuses reasoning fields on an assistant message, so a
+replayed `reasoning`, `reasoning_content` or `reasoning_details` is left out of what it is sent. Large 4 takes
+`reasoning_effort` `low`, `medium` and `high`, and Small 4 and Medium take `none` and `high`; another level
+moves to the nearest one the model takes, so `none` on Large 4 is sent as `low`.
+
+### Groq
+
+`groq` lists its chat models; the speech (`orpheus`), transcription (`whisper`) and prompt-classifier
+(`prompt-guard`) models stay out. Each listed model says whether it calls tools, reads images and reasons. Groq
+takes `reasoning` on a replayed assistant message but refuses `reasoning_content` and `reasoning_details`, so
+those are sent as `reasoning` or left out. GPT-OSS takes `reasoning_effort` `low`, `medium` and `high` (`none`
+is sent as `low`), and Qwen also takes `none`.
+
+### Z.ai
+
+`zai` calls Z.ai's GLM models. Its catalog names models only, so each listed model says what the router knows:
+every GLM model calls tools and thinks, and only the Flash models (`glm-5.3-flash`, `glm-5.3-flashx`) read
+images; another model sent an image is refused in plain words. GLM answers with `reasoning_content`, and
+continues its thinking across tool calls from the same field, so a replayed `reasoning` is sent as
+`reasoning_content`. GLM-5.3 and its Flash models always think and take `reasoning_effort` `low`, `high` and
+`max` (`none` is sent as `low`, `medium` as `high`); GLM-5.2 takes every level. Earlier GLM models ignore
+`reasoning_effort` and are switched with `thinking.type`: `none` turns thinking off and any other level on.
+
 ### Vertex AI
 
-Use `kind = "gemini"` with a Vertex AI publisher URL and `auth_header = "authorization"`, which sends the
-credential as an OAuth Bearer token instead of a Gemini API key:
+Use `kind = "gemini"` with a Vertex AI publisher URL. With a Vertex AI API key (`AIza…`, or `AQ.…` for a key
+bound to a service account), no project is needed: the key already belongs to one, and the global publisher
+endpoint serves it.
+
+```toml
+[providers.vertex]
+kind = "gemini"
+base_url = "https://aiplatform.googleapis.com/v1/publishers/google"
+api_key_env = "GOOGLE_VERTEX_API_KEY"
+```
+
+The key goes in `x-goog-api-key`. Google does not let an API key read the Model Garden catalog, so discovery
+checks a built-in list of current Gemini models with Vertex's free `countTokens` call and lists the ones the
+key's project can use. Any other model can still be requested by its ID.
+
+With an OAuth access token instead, name the project and location and set `auth_header = "authorization"`,
+which sends the token as a Bearer token:
 
 ```toml
 [providers.vertex]
@@ -45,7 +89,9 @@ api_key_env = "VERTEX_ACCESS_TOKEN"
 ```
 
 Model discovery then lists Google's Model Garden chat models. The router reads the token once at startup,
-so a short-lived access token needs a restart before it expires.
+so a short-lived access token needs a restart before it expires; an API key does not expire. A Google API
+key is always sent in `x-goog-api-key`, even under `auth_header = "authorization"`, because Google refuses
+one as a Bearer token.
 
 ### Amazon Bedrock
 
@@ -81,6 +127,8 @@ Capability fields are:
 | OpenAI | `openai` | text, streaming, images, input audio, PDF text extraction, function, custom and parallel tools, structured outputs, reasoning, opaque reasoning, logprobs, seed, multiple choices, audio output |
 | Anthropic | `anthropic` | text, streaming, images, PDF, PDF text extraction, function and parallel tools, structured outputs, reasoning, opaque reasoning |
 | Gemini | `gemini` | text, streaming, images, input audio, PDF, PDF text extraction, video, function and parallel tools, structured outputs, reasoning, opaque reasoning |
+| Mistral | `mistral` | text, streaming, images, PDF text extraction, function and parallel tools, structured outputs, reasoning |
+| Groq, Z.ai | `groq`, `zai` | text, streaming, images, PDF text extraction, function and parallel tools, reasoning |
 | Conservative | every other kind | text, streaming, function tools, PDF text extraction |
 
 A `capabilities` object on a provider or a model **replaces** the defaults rather than adding to them, so

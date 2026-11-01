@@ -43,7 +43,10 @@ pub(crate) async fn discover(
     if protocol == ProviderProtocol::BedrockConverse {
         return bedrock::discover(&client, config, key).await;
     }
-    let vertex = vertex_catalog_url(config);
+    if vertex_publisher(config) && crate::gemini::google_api_key(key.expose_secret()) {
+        return vertex_key_models(&client, config, key).await;
+    }
+    let vertex = vertex_catalog_url(config, key);
     // xAI's `/models` mixes its image and video generators in with its chat
     // models and says nothing of their input; `/language-models` lists only
     // the chat models, with their input and reasoning levels.
@@ -88,7 +91,7 @@ pub(crate) async fn discover(
                 .header("x-api-key", key.expose_secret())
                 .header("anthropic-version", "2023-06-01"),
             ProviderProtocol::GeminiGenerateContent => {
-                if config.auth_header.as_deref() == Some("authorization") {
+                if crate::gemini::sends_bearer(config, key.expose_secret()) {
                     request.bearer_auth(key.expose_secret())
                 } else {
                     request.header("x-goog-api-key", key.expose_secret())
@@ -161,24 +164,81 @@ async fn read_json(request: reqwest::RequestBuilder) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn vertex_catalog_url(config: &ProviderConfig) -> Option<url::Url> {
-    if config.kind.protocol() != ProviderProtocol::GeminiGenerateContent
-        || config.auth_header.as_deref() != Some("authorization")
-    {
+/// A Gemini provider whose base URL is a Vertex AI publisher path, with or
+/// without a project: `…/v1/publishers/google` or
+/// `…/v1/projects/<project>/locations/<location>/publishers/google`.
+fn vertex_publisher(config: &ProviderConfig) -> bool {
+    config.kind.protocol() == ProviderProtocol::GeminiGenerateContent
+        && config.effective_base_url().is_ok_and(|base| {
+            url::Url::parse(&base).is_ok_and(|url| {
+                url.path()
+                    .trim_end_matches('/')
+                    .ends_with("/publishers/google")
+            })
+        })
+}
+
+fn vertex_catalog_url(config: &ProviderConfig, key: &SecretString) -> Option<url::Url> {
+    if !vertex_publisher(config) || !crate::gemini::sends_bearer(config, key.expose_secret()) {
         return None;
     }
     let mut url = url::Url::parse(&config.effective_base_url().ok()?).ok()?;
-    if !url
-        .path()
-        .trim_end_matches('/')
-        .ends_with("/publishers/google")
-    {
-        return None;
-    }
     // Model Garden listing is a publisher resource, not a project-scoped inference resource.
     url.set_path("/v1beta1/publishers/google/models");
     url.set_query(None);
     Some(url)
+}
+
+/// Vertex's Model Garden listing takes only OAuth access tokens, so with an
+/// API key the router cannot read the catalog. These are the Gemini chat
+/// models Vertex serves; each is kept only when the key's project reaches it,
+/// which the free `countTokens` call answers. Models missing here can still be
+/// requested by ID.
+const VERTEX_KEY_MODELS: [&str; 12] = [
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+];
+
+async fn vertex_key_models(
+    client: &reqwest::Client,
+    config: &ProviderConfig,
+    key: &SecretString,
+) -> Option<Vec<ModelObject>> {
+    let base = config.effective_base_url().ok()?;
+    let base = base.trim_end_matches('/');
+    let probe = json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]});
+    let found = futures::future::join_all(VERTEX_KEY_MODELS.iter().map(|id| {
+        let request = client
+            .post(format!("{base}/models/{id}:countTokens"))
+            .header("x-goog-api-key", key.expose_secret())
+            .json(&probe);
+        async move {
+            let response = request.send().await.ok()?;
+            response.status().is_success().then_some(*id)
+        }
+    }))
+    .await;
+    let models: Vec<_> = found
+        .into_iter()
+        .flatten()
+        .filter_map(|id| {
+            model_entry(
+                config,
+                &json!({"name":format!("models/{id}"), "displayName":id, "supportedGenerationMethods":["generateContent"]}),
+            )
+        })
+        .collect();
+    (!models.is_empty()).then_some(models)
 }
 
 fn vertex_model(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
@@ -346,6 +406,56 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
             .or_insert(json!(efforts));
         copy(entry, "context_length", &mut metadata, "context_window");
         metadata.insert("supports_tools".into(), json!(true));
+    } else if config.kind == ProviderKind::Mistral {
+        // Mistral lists embeddings, OCR, moderation, speech and transcription
+        // beside its chat models, and says which is which.
+        if entry.pointer("/capabilities/completion_chat") == Some(&json!(false)) {
+            return None;
+        }
+        for (from, to) in [
+            ("/capabilities/function_calling", "supports_tools"),
+            ("/capabilities/vision", "supports_vision"),
+            ("/capabilities/reasoning", "supports_reasoning"),
+        ] {
+            if let Some(value) = entry.pointer(from).filter(|value| value.is_boolean()) {
+                metadata.insert(to.into(), value.clone());
+            }
+        }
+        copy(entry, "max_context_length", &mut metadata, "context_window");
+        known_efforts(config, id, &mut metadata);
+    } else if config.kind == ProviderKind::Zai {
+        // Z.ai's catalog names its models and nothing more. Every GLM chat
+        // model calls tools and thinks; only the Flash models read images.
+        metadata.insert("supports_tools".into(), json!(true));
+        metadata.insert("supports_reasoning".into(), json!(true));
+        metadata.insert("supports_vision".into(), json!(id.contains("-flash")));
+        known_efforts(config, id, &mut metadata);
+    } else if config.kind == ProviderKind::Groq {
+        // Groq lists speech (`orpheus`), transcription (`whisper`) and
+        // prompt-classifier models beside its chat models.
+        let speaks_text = entry["output_modalities"]
+            .as_array()
+            .is_none_or(|outputs| outputs.iter().any(|output| output == "text"));
+        if !speaks_text || id.contains("prompt-guard") {
+            return None;
+        }
+        let features = entry["supported_features"].as_array();
+        let has = |feature: &str| features.is_some_and(|all| all.iter().any(|f| f == feature));
+        metadata.insert("supports_tools".into(), json!(has("tools")));
+        metadata.insert("supports_reasoning".into(), json!(has("reasoning")));
+        if let Some(inputs) = entry["input_modalities"].as_array() {
+            metadata.insert(
+                "supports_vision".into(),
+                json!(inputs.iter().any(|input| input == "image")),
+            );
+        }
+        copy(
+            entry,
+            "max_completion_tokens",
+            &mut metadata,
+            "max_output_tokens",
+        );
+        known_efforts(config, id, &mut metadata);
     } else if config.kind.is_native_openai() {
         let efforts = openai_reasoning_efforts(id);
         let supports_reasoning = metadata
@@ -385,6 +495,16 @@ fn model_entry(config: &ProviderConfig, entry: &Value) -> Option<ModelObject> {
         owned_by: String::new(),
         metadata,
     })
+}
+
+/// The levels a thinking model takes, where the router knows them.
+fn known_efforts(config: &ProviderConfig, id: &str, metadata: &mut BTreeMap<String, Value>) {
+    let efforts = crate::openai_compatible::compatible_reasoning_efforts(config.kind, id);
+    if metadata.get("supports_reasoning") == Some(&json!(true)) && !efforts.is_empty() {
+        metadata
+            .entry("reasoning_efforts".into())
+            .or_insert(json!(efforts));
+    }
 }
 
 fn copy(entry: &Value, from: &str, metadata: &mut BTreeMap<String, Value>, to: &str) {
@@ -855,6 +975,115 @@ mod tests {
             );
         }
         assert!(model_entry(&config, &json!({"name":"models/gemini-embedding-2","supportedGenerationMethods":["embedContent"]})).is_none());
+    }
+
+    #[test]
+    fn mistral_and_groq_list_only_chat_models_with_what_each_can_do() {
+        let config =
+            |kind| -> ProviderConfig { serde_json::from_value(json!({"kind": kind})).unwrap() };
+        let mistral = config("mistral");
+        // Entries as Mistral's `/models` lists them.
+        let entry = |id: &str, chat: bool, reasoning: bool| {
+            json!({"id": id, "name": "mistral-large-4", "max_context_length": 1_048_576,
+                "capabilities": {"completion_chat": chat, "function_calling": chat, "vision": chat, "reasoning": reasoning}})
+        };
+        let large = model_entry(&mistral, &entry("mistral-large-4-0", true, true)).unwrap();
+        assert_eq!(
+            large.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
+        assert_eq!(large.metadata["supports_vision"], json!(true));
+        assert_eq!(large.metadata["supports_tools"], json!(true));
+        assert_eq!(large.metadata["context_window"], json!(1_048_576));
+        assert!(!large.metadata.contains_key("name"));
+        let small = model_entry(&mistral, &entry("mistral-small-latest", true, true)).unwrap();
+        assert_eq!(small.metadata["reasoning_efforts"], json!(["none", "high"]));
+        let plain = model_entry(&mistral, &entry("ministral-8b-latest", true, false)).unwrap();
+        assert_eq!(plain.metadata["reasoning_efforts"], json!([]));
+        for id in [
+            "mistral-embed",
+            "mistral-ocr-latest",
+            "voxtral-mini-tts-latest",
+            "mistral-moderation-2603",
+        ] {
+            assert!(
+                model_entry(&mistral, &entry(id, false, false)).is_none(),
+                "{id}"
+            );
+        }
+        let zai = config("zai");
+        // Z.ai lists ids only, as `{"id":"glm-5.3","object":"model","owned_by":"z-ai"}`.
+        let glm = |id: &str| {
+            model_entry(
+                &zai,
+                &json!({"id": id, "object": "model", "owned_by": "z-ai"}),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            glm("glm-5.3").metadata["reasoning_efforts"],
+            json!(["low", "high", "max"])
+        );
+        assert_eq!(glm("glm-5.3").metadata["supports_vision"], json!(false));
+        assert_eq!(
+            glm("glm-5.3-flashx").metadata["supports_vision"],
+            json!(true)
+        );
+        assert_eq!(
+            glm("glm-4.7").metadata["reasoning_efforts"],
+            json!(["none", "high"])
+        );
+        assert_eq!(glm("glm-4.7").metadata["supports_tools"], json!(true));
+        let groq = config("groq");
+        let entry = |id: &str, input: &[&str], output: &str, features: Value| {
+            json!({"id": id, "input_modalities": input, "output_modalities": [output],
+                "supported_features": features, "max_completion_tokens": 65_536})
+        };
+        let oss = model_entry(
+            &groq,
+            &entry(
+                "openai/gpt-oss-120b",
+                &["text"],
+                "text",
+                json!(["tools", "reasoning"]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(oss.metadata["supports_reasoning"], json!(true));
+        assert_eq!(
+            oss.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
+        assert_eq!(oss.metadata["supports_vision"], json!(false));
+        assert_eq!(oss.metadata["max_output_tokens"], json!(65_536));
+        let qwen = model_entry(
+            &groq,
+            &entry(
+                "qwen/qwen3.8-27b",
+                &["text", "image"],
+                "text",
+                json!(["tools", "reasoning"]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(qwen.metadata["supports_vision"], json!(true));
+        let allam = model_entry(
+            &groq,
+            &entry("allam-2-7b", &["text"], "text", json!(["json_mode"])),
+        )
+        .unwrap();
+        assert_eq!(allam.metadata["supports_tools"], json!(false));
+        assert_eq!(allam.metadata["reasoning_efforts"], json!([]));
+        for (id, input, output) in [
+            ("whisper-large-v3-turbo", "audio", "transcription"),
+            ("canopylabs/orpheus-v1-english", "text", "speech"),
+            ("meta-llama/llama-prompt-guard-2-86m", "text", "text"),
+        ] {
+            assert!(
+                model_entry(&groq, &entry(id, &[input], output, Value::Null)).is_none(),
+                "{id}"
+            );
+        }
     }
 
     #[test]

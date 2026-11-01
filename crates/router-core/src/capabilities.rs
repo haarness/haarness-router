@@ -108,14 +108,29 @@ impl Capabilities {
             },
             // Grok thinks at chosen levels (`reasoning_effort`) or at a fixed
             // depth, reads images, calls tools in parallel and answers to a
-            // JSON schema; its reasoning text is not opaque.
-            CapabilityProfile::Xai => Self {
+            // JSON schema; its reasoning text is not opaque. Mistral's current
+            // chat models do the same, and its catalog narrows this per model.
+            CapabilityProfile::Xai | CapabilityProfile::Mistral => Self {
                 text: true,
                 streaming: true,
                 images: true,
                 function_tools: true,
                 parallel_tools: true,
                 structured_outputs: true,
+                reasoning: true,
+                pdf_text_extraction: true,
+                ..Self::default()
+            },
+            // Groq's GPT-OSS and Qwen models think at chosen levels and call
+            // tools, and Qwen reads images; its catalog says which model does
+            // what. Z.ai's GLM models think and call tools, and its Flash
+            // models read images.
+            CapabilityProfile::Groq | CapabilityProfile::Zai => Self {
+                text: true,
+                streaming: true,
+                images: true,
+                function_tools: true,
+                parallel_tools: true,
                 reasoning: true,
                 pdf_text_extraction: true,
                 ..Self::default()
