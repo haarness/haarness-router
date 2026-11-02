@@ -5,13 +5,13 @@ Requires the Stackforward credential YAML, a built router and Haarness binary,
 plus tmux. Never prints or writes upstream provider keys. HAARNESS_LIVE_MODELS
 may select a comma-separated subset; omitted means all current default cases.
 """
-import json, os, pathlib, queue, re, secrets, shlex, socket, subprocess, tempfile, threading, time, urllib.request, urllib.error
+import json, os, pathlib, queue, re, secrets, shlex, socket, subprocess, sys, tempfile, threading, time, urllib.request, urllib.error
 
 root = pathlib.Path(tempfile.mkdtemp(prefix='haarness-router-attach-')).resolve()
 repo = pathlib.Path(__file__).resolve().parents[2]
 binary = pathlib.Path(os.environ.get('HAARNESS_BIN', str(repo/'haarness/target/debug/haarness'))).resolve()
 router_repo = repo/'haarness-router'
-secrets_file = os.environ.get('HAARNESS_STACKFORWARD_SECRETS', '/Users/alex/work/stackforward/robowork/robowork-backend-stack/environments/prod/group_vars/all.yml')
+secrets_file = os.environ.get('HAARNESS_STACKFORWARD_SECRETS') or sys.exit('Set HAARNESS_STACKFORWARD_SECRETS to the Stackforward credential YAML.')
 router_binary = pathlib.Path(os.environ.get('HAARNESS_ROUTER_BIN', str(router_repo/'target/debug/haarness-router'))).resolve()
 server_workspace = root/'server-workspace'
 client_workspace = root/'client-workspace'

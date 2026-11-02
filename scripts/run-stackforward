@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir="${0:A:h}"
 router_root="${script_dir:h}"
 local_env="${router_root}/.env"
-secrets_file="${HAARNESS_STACKFORWARD_SECRETS:-/Users/alex/work/stackforward/robowork/robowork-backend-stack/environments/prod/group_vars/all.yml}"
+secrets_file="${HAARNESS_STACKFORWARD_SECRETS:-}"
 router_config="${HAARNESS_ROUTER_CONFIG:-${router_root}/config.stackforward.toml}"
 router_profile="${HAARNESS_ROUTER_PROFILE:-release}"
 case "${router_profile}" in
@@ -50,6 +50,13 @@ load_local_default HAARNESS_UI_PASSWORD
 
 echo "Local router and Web UI credentials are available in ${local_env} (mode 0600)."
 
+if [[ -z "${secrets_file}" ]]; then
+  secrets_file="$(grep -E '^HAARNESS_STACKFORWARD_SECRETS=' "${local_env}" | tail -n 1 | cut -d= -f2-)" || true
+fi
+if [[ -z "${secrets_file}" ]]; then
+  echo "Set HAARNESS_STACKFORWARD_SECRETS, here or in ${local_env}, to the Stackforward secret YAML." >&2
+  exit 1
+fi
 if [[ ! -r "${secrets_file}" ]]; then
   echo "Stackforward secret YAML is not readable: ${secrets_file}" >&2
   exit 1

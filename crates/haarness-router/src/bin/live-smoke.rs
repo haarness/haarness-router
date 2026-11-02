@@ -40,11 +40,9 @@ enum Feature {
 #[derive(Parser)]
 #[command(about = "Run capped live OpenAI, Anthropic, and Gemini smoke tests")]
 struct Args {
-    #[arg(
-        long,
-        default_value = "/Users/alex/work/stackforward/robowork/robowork-backend-stack/environments/prod/group_vars/all.yml"
-    )]
-    stackforward_secrets: PathBuf,
+    /// The maintainers' credential YAML; not needed with `--keys-from-env`.
+    #[arg(long, env = "HAARNESS_STACKFORWARD_SECRETS")]
+    stackforward_secrets: Option<PathBuf>,
     /// Read the keys from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and
     /// `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) instead of the credential YAML.
     #[arg(long)]
@@ -111,8 +109,11 @@ async fn main() -> Result<()> {
     let mut secrets = if args.keys_from_env {
         environment_secrets(args.only.as_deref())?
     } else {
-        let raw = std::fs::read_to_string(&args.stackforward_secrets)
-            .with_context(|| format!("failed to read {}", args.stackforward_secrets.display()))?;
+        let path = args.stackforward_secrets.as_ref().context(
+            "pass --stackforward-secrets or set HAARNESS_STACKFORWARD_SECRETS, or use --keys-from-env",
+        )?;
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
         serde_yaml::from_str(&raw).context("failed to parse Stackforward secret YAML")?
     };
     if args.anthropic_key_stdin {

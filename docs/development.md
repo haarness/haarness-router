@@ -56,8 +56,8 @@ machines. It:
 1. creates or reuses the ignored, mode-0600 `.env` in the repository root with a random
    `HAARNESS_ROUTER_KEY` and separate `HAARNESS_UI_USERNAME`/`HAARNESS_UI_PASSWORD` for the dashboard;
 2. reads the OpenAI, Anthropic and Gemini keys from a private YAML file (`openai_api_key`,
-   `claude_api_key`, `gemini_api_key`) named by `HAARNESS_STACKFORWARD_SECRETS`, without printing or
-   copying them;
+   `claude_api_key`, `gemini_api_key`) named by `HAARNESS_STACKFORWARD_SECRETS`, in the environment or
+   that `.env`, without printing or copying them;
 3. builds the binary and starts it with `config.stackforward.toml`, or the file named by
    `HAARNESS_ROUTER_CONFIG` or `--config`, passing every other argument through.
 

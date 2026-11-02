@@ -11,17 +11,20 @@ LAUNCHER = Path(__file__).resolve().parent / "run-stackforward"
 
 
 class LauncherProfileTests(unittest.TestCase):
-    def check_profile(self, profile, expected):
+    def check_profile(self, profile, expected, secrets_from="env", failure=2):
         with tempfile.TemporaryDirectory(prefix="router-launcher-test-") as tmp:
             root = Path(tmp).resolve()
             scripts = root / "scripts"
             scripts.mkdir()
             launcher = scripts / "run-stackforward"
             launcher.write_text(LAUNCHER.read_text())
-            # Fixture values only. The launcher's credential behavior is unchanged.
-            (root / ".env").write_text("HAARNESS_ROUTER_KEY=fixture-key\nHAARNESS_UI_USERNAME=fixture-user\nHAARNESS_UI_PASSWORD=fixture-password\n")
             secrets = root / "fixture.yml"
             secrets.write_text("fixture: true\n")
+            # Fixture values only. The launcher's credential behavior is unchanged.
+            dotenv = "HAARNESS_ROUTER_KEY=fixture-key\nHAARNESS_UI_USERNAME=fixture-user\nHAARNESS_UI_PASSWORD=fixture-password\n"
+            if secrets_from == "dotenv":
+                dotenv += f"HAARNESS_STACKFORWARD_SECRETS={secrets}\n"
+            (root / ".env").write_text(dotenv)
             stub = '''#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
@@ -37,13 +40,15 @@ Path(os.environ['LAUNCHER_TEST_RECORD'] + '-' + name).write_text(json.dumps(sys.
             env = dict(os.environ)
             env.pop("HAARNESS_ROUTER_PROFILE", None)
             env["PATH"] = str(scripts) + os.pathsep + env["PATH"]
-            env["HAARNESS_STACKFORWARD_SECRETS"] = str(secrets)
+            env.pop("HAARNESS_STACKFORWARD_SECRETS", None)
+            if secrets_from == "env":
+                env["HAARNESS_STACKFORWARD_SECRETS"] = str(secrets)
             env["LAUNCHER_TEST_RECORD"] = str(root / "record")
             if profile is not None:
                 env["HAARNESS_ROUTER_PROFILE"] = profile
             result = subprocess.run(["zsh", str(launcher), "--port", "9191", "--set", "web_ui.enabled=false"], env=env, capture_output=True, text=True)
             if expected is None:
-                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.returncode, failure)
                 self.assertFalse((root / "record-cargo").exists())
                 self.assertFalse((root / "record-ruby").exists())
                 return
@@ -51,6 +56,7 @@ Path(os.environ['LAUNCHER_TEST_RECORD'] + '-' + name).write_text(json.dumps(sys.
             cargo = json.loads((root / "record-cargo").read_text())
             self.assertEqual(cargo, ["build", "--profile", profile or "release", "--bin", "haarness-router", "--quiet"])
             ruby = json.loads((root / "record-ruby").read_text())
+            self.assertEqual(ruby[1], str(secrets))
             self.assertEqual(ruby[2], str(root / "target" / expected / "haarness-router"))
             self.assertEqual(ruby[-4:], ["--port", "9191", "--set", "web_ui.enabled=false"])
 
@@ -65,6 +71,12 @@ Path(os.environ['LAUNCHER_TEST_RECORD'] + '-' + name).write_text(json.dumps(sys.
 
     def test_invalid_profile(self):
         self.check_profile("../../other", None)
+
+    def test_secrets_path_from_dotenv(self):
+        self.check_profile(None, "release", secrets_from="dotenv")
+
+    def test_secrets_path_required(self):
+        self.check_profile(None, None, secrets_from=None, failure=1)
 
 
 if __name__ == "__main__":
