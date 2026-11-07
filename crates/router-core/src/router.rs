@@ -817,8 +817,9 @@ fn for_key(mut error: RouterError, own_key: bool) -> RouterError {
 /// a row, so the router holds the next ones back until the cooldown ends.
 fn resting(breaker: &CircuitBreaker) -> RouterError {
     let wait = breaker.reopens_in().map_or(1, |wait| wait.as_secs().max(1));
+    let unit = if wait == 1 { "second" } else { "seconds" };
     let mut error = RouterError::unavailable(format!(
-        "This model's provider failed several requests in a row, so the router is holding requests to it for a moment. Try again in {wait} seconds, or choose another model."
+        "This model's provider failed several requests in a row, so the router is holding requests to it for a moment. Try again in {wait} {unit}, or choose another model."
     ));
     error.retry_after_secs =
         std::num::NonZeroU16::new(u16::try_from(wait).unwrap_or(u16::MAX).max(1));
@@ -1776,11 +1777,9 @@ mod tests {
         );
         let wait: u64 = error.retry_after_header().unwrap().parse().unwrap();
         assert!((1..=30).contains(&wait), "{wait}");
-        assert!(
-            error
-                .body
-                .message
-                .contains(&format!("Try again in {wait} seconds"))
-        );
+        assert!(error.body.message.contains(&format!(
+            "Try again in {wait} {}",
+            if wait == 1 { "second," } else { "seconds," }
+        )));
     }
 }

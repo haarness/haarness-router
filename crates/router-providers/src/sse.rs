@@ -287,6 +287,29 @@ fn plain_refusal(
             "This model reads only text. Send the request without the image or file, or choose a model that reads them.".to_owned(),
         ));
     }
+    // A prompt longer than the model's window ("This endpoint's maximum context
+    // length is 16384 tokens", OpenAI's context_length_exceeded, Claude's
+    // "prompt is too long"): a client compacts the conversation on these words,
+    // which "upstream returned HTTP 400" never gave it.
+    if matches!(status.as_u16(), 400 | 413)
+        && [
+            "context_length_exceeded",
+            "maximum context length",
+            "context length exceeded",
+            "context window exceeded",
+            "exceeds the context window",
+            "model_context_window_exceeded",
+            "prompt is too long",
+            "input is too long",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return Some((
+            status,
+            "The conversation is longer than this model's maximum context length, so the provider refused it. Compact the conversation, or choose a model with a larger context window.".to_owned(),
+        ));
+    }
     match status.as_u16() {
         401 | 403 if lower.contains("api keys are not supported") => Some((
             status,
@@ -303,10 +326,12 @@ fn plain_refusal(
         429 => Some((
             status,
             match retry_after {
-                Some(wait) => format!(
-                    "The provider is rate limiting this key. Try again in {} seconds.",
-                    wait.as_secs().max(1)
-                ),
+                Some(wait) => match wait.as_secs().max(1) {
+                    1 => "The provider is rate limiting this key. Try again in 1 second.".to_owned(),
+                    seconds => format!(
+                        "The provider is rate limiting this key. Try again in {seconds} seconds."
+                    ),
+                },
                 None => "The provider is rate limiting this key. Try again shortly.".to_owned(),
             },
         )),
@@ -417,6 +442,39 @@ mod tests {
         );
         assert!(plain_refusal(http::StatusCode::NOT_FOUND, "{}", None).is_none());
         assert!(plain_refusal(http::StatusCode::BAD_REQUEST, groq, None).is_none());
+        assert_eq!(
+            plain_refusal(
+                http::StatusCode::TOO_MANY_REQUESTS,
+                "{}",
+                Some(Duration::from_millis(400))
+            )
+            .unwrap()
+            .1,
+            "The provider is rate limiting this key. Try again in 1 second."
+        );
+    }
+
+    #[test]
+    fn a_prompt_longer_than_the_window_says_so_in_words_a_client_compacts_on() {
+        let openrouter = r#"{"error":{"message":"This endpoint's maximum context length is 32768 tokens. However, you requested about 41797 tokens (337 of text input, 15246 of tool input, 26214 in the output). Please reduce the length of either one, or use the context-compression plugin to compress your prompt automatically.","code":400}}"#;
+        let openai = r#"{"error":{"message":"Your input exceeds the context window of this model.","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let claude = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#;
+        for body in [openrouter, openai, claude] {
+            let (status, message) =
+                plain_refusal(http::StatusCode::BAD_REQUEST, body, None).expect(body);
+            assert_eq!(status, http::StatusCode::BAD_REQUEST);
+            assert!(message.contains("maximum context length"), "{message}");
+            assert!(!message.contains("41797") && !message.contains("210000"));
+        }
+        // Another 400 keeps the generic status line.
+        assert!(
+            plain_refusal(
+                http::StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"messages.1.content: unexpected field"}}"#,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
