@@ -107,14 +107,23 @@ An upstream HTTP error keeps its status and gets the code `upstream_<status>` (f
 credentials. Refusals a caller can act on are said in the router's words: a refused key (401 or 403), a
 Vertex AI endpoint that takes only keys bound to a service account, a rate limit (429, with the provider's
 `Retry-After` passed on as the response's own), and a request larger than the plan's tokens a minute, which
-becomes `413 upstream_413` with the request's size and the limit, since waiting never clears it. Any other
+becomes `413 upstream_413` with the request's size and the limit, since waiting never clears it. A provider
+account with no credit left (or too little for the request: Anthropic's "credit balance is too low", OpenAI's
+`insufficient_quota`, a 402 from OpenRouter or DeepSeek, xAI's spent credits) gets the code
+`provider_out_of_credit`. With the caller's own key (`X-Upstream-API-Key`) it is a `402` that says to add credit
+or use another key; with the router's own key it is a `503` that says the router's account has to be topped up
+and to choose a model from another provider meanwhile. An alias moves on to its next target, and the circuit
+stays closed, so every caller keeps reading why. Errors a provider sends inside its stream keep their status:
+OpenRouter's `{"error":{"code":429}}` is a `429` with the rate-limit words, a `400` is not tried again. Any other
 message names at most the provider's machine-readable error type, such as
 `upstream returned HTTP 400 (invalid_request_error)`. When a provider refuses a model as unknown (a 404 or a
 `model_not_found` type) and its catalog has been read, the message goes on to name up to three models it
 lists now, closest names first, for example `upstream returned HTTP 404 (model_not_found). openai no longer
 lists gpt-6; try openai/gpt-7, openai/gpt-7-mini or openai/o5.` Status and code stay the same. Transport
 failures are `502 upstream_transport_error` and deadlines `504 upstream_timeout`. When every target of an
-alias failed, the last retryable error is returned, or `503 no_route_available` when no target could be tried (for example, every circuit is open).
+alias failed, the last retryable error is returned, or `503 no_route_available` when no target could be tried. A
+target whose circuit is open (three failures in a row) is held back for 30 seconds: its `503
+no_route_available` says so, names the seconds left and sends them as `Retry-After`.
 
 A router that has no provider for the request says what to set up instead, with `param` `model`:
 `400 no_providers_configured` when it has no providers at all, and, for a router started

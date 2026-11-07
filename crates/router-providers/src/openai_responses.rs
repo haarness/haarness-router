@@ -106,7 +106,8 @@ pub(crate) async fn stream(
                     yield ProviderEvent::Finish { index: 0, reason: reason.into() };
                     completed = true;
                 }
-                "response.failed" | "error" => Err(RouterError::upstream(http::StatusCode::BAD_GATEWAY, "OpenAI Responses stream returned an error"))?,
+                "response.failed" | "error" => Err(RouterError::upstream(http::StatusCode::BAD_GATEWAY, "OpenAI Responses stream returned an error")
+                    .with_upstream_detail(router_core::detail::from_error_value(event.get("response").filter(|response| response.get("error").is_some()).unwrap_or(&event))))?,
                 _ => {}
             }
         }

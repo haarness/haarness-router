@@ -135,12 +135,8 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         let events = Box::pin(try_stream! {
             while let Some(value) = source.next().await {
                 let value = value?;
-                if let Some(error) = value.get("error") {
-                    let code = error.get("code").and_then(Value::as_str).unwrap_or("upstream_stream_error");
-                    Err(RouterError::upstream(
-                        http::StatusCode::BAD_GATEWAY,
-                        format!("upstream stream reported {code}"),
-                    ))?;
+                if value.get("error").is_some_and(|error| !error.is_null()) {
+                    Err(crate::sse::stream_error(&value))?;
                 }
                 if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
                     yield ProviderEvent::Usage(parse_usage(usage));

@@ -130,7 +130,8 @@ impl ProviderAdapter for GeminiAdapter {
                 let event = event?;
                 if let Some(error) = event.get("error") {
                     let status = error.get("status").and_then(Value::as_str).unwrap_or("UNKNOWN");
-                    Err(RouterError::upstream(http::StatusCode::BAD_GATEWAY, format!("Gemini stream returned {status}")))?;
+                    Err(RouterError::upstream(http::StatusCode::BAD_GATEWAY, format!("Gemini stream returned {status}"))
+                        .with_upstream_detail(router_core::detail::from_error_value(&event)))?;
                 }
                 if let Some(usage) = event.get("usageMetadata") {
                     yield ProviderEvent::Usage(gemini_usage(usage));

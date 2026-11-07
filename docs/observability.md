@@ -2,7 +2,8 @@
 
 The router reports through three channels: health endpoints, Prometheus metrics and logs. None of
 them carries prompts, attachments, tool arguments, upstream bodies, credentials or the raw model string a
-client sent; label values come only from the configuration.
+client sent; label values come only from the configuration. The one piece of a provider's answer that is
+logged is its explanation of a failure, scrubbed as described under [logs](#logs).
 
 ## Health
 
@@ -67,7 +68,12 @@ At `info`, each chat completion request writes one `request finished` line with:
 caller's W3C trace ID when a valid `traceparent` arrived, alias (`_direct` for an exact model), provider,
 model label (declared or `_undeclared`), HTTP status, outcome (`completed`, `failed`, `cancelled`, or
 `rejected` before any upstream call), the router's error code, the fallback count, the provider's own
-request ID and the duration. `debug` adds a `request routed` line with the same labels.
+request ID and the duration. A failed request adds `upstream_detail`, the provider's own explanation
+("Your credit balance is too low to access the Anthropic API…", or OpenRouter's message followed by the
+serving provider's), on one line, at most 300 characters, with anything that could carry what the caller
+sent or whose account it is replaced by `‹…›`: quoted text longer than a short field name, runs of seven or
+more digits, email addresses, link paths, and long words that mix cases with digits or carry many digits
+(keys, tokens, IDs). `debug` adds a `request routed` line with the same labels.
 
 ## Correlating a request
 

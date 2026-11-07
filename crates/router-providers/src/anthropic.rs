@@ -196,7 +196,8 @@ impl ProviderAdapter for AnthropicAdapter {
                     "error" => Err(RouterError::upstream(
                         http::StatusCode::BAD_GATEWAY,
                         "Anthropic stream returned an error event",
-                    ))?,
+                    )
+                    .with_upstream_detail(router_core::detail::from_error_value(&event)))?,
                     _ => {}
                 }
             }
