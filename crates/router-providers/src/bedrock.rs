@@ -290,7 +290,9 @@ fn converse_request(request: &ChatCompletionRequest) -> Result<Value, RouterErro
                 .tool_call_id
                 .as_deref()
                 .ok_or_else(|| RouterError::invalid("tool_call_id is required", "messages"))?;
-            content = vec![json!({"toolResult":{"toolUseId":id,"content":content}})];
+            content = vec![
+                json!({"toolResult":{"toolUseId":crate::tool_ids::portable(id),"content":content}}),
+            ];
         }
         for call in &message.tool_calls {
             let function = call
@@ -300,7 +302,7 @@ fn converse_request(request: &ChatCompletionRequest) -> Result<Value, RouterErro
             let input: Value = serde_json::from_str(&function.arguments)
                 .map_err(|_| RouterError::invalid("Tool arguments must be JSON", "messages"))?;
             content
-                .push(json!({"toolUse":{"toolUseId":call.id,"name":function.name,"input":input}}));
+                .push(json!({"toolUse":{"toolUseId":crate::tool_ids::portable(&call.id),"name":function.name,"input":input}}));
         }
         if let Some(last) = messages.last_mut().filter(|m| m["role"] == role) {
             last["content"].as_array_mut().unwrap().extend(content);
@@ -419,6 +421,19 @@ mod tests {
             "c1"
         );
         assert_eq!(body["toolConfig"]["toolChoice"], json!({"any":{}}));
+    }
+    #[test]
+    fn another_providers_tool_ids_take_the_characters_converse_accepts() {
+        let request = serde_json::from_value(json!({"model":"amazon-bedrock/test","messages":[{"role":"user","content":"weather"},{"role":"assistant","tool_calls":[{"id":"functions.weather:0","type":"function","function":{"name":"weather","arguments":"{}"}}]},{"role":"tool","tool_call_id":"functions.weather:0","content":"sunny"}]})).unwrap();
+        let body = converse_request(&request).unwrap();
+        assert_eq!(
+            body["messages"][1]["content"][0]["toolUse"]["toolUseId"],
+            "functions_weather_0"
+        );
+        assert_eq!(
+            body["messages"][2]["content"][0]["toolResult"]["toolUseId"],
+            "functions_weather_0"
+        );
     }
     #[tokio::test]
     async fn real_http_stream_uses_bearer_and_converse_and_preserves_tools_usage() {

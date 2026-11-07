@@ -600,7 +600,7 @@ fn anthropic_message(message: &Message) -> Result<Value, RouterError> {
             )
         })?;
         let mut content = vec![json!({
-            "type": "tool_result", "tool_use_id": id,
+            "type": "tool_result", "tool_use_id": crate::tool_ids::portable(id),
             "content": message_texts(message)?.join("\n")
         })];
         apply_message_cache_control(&mut content, message)?;
@@ -659,7 +659,7 @@ fn anthropic_message(message: &Message) -> Result<Value, RouterError> {
                 )
             })?;
             content.push(
-                json!({"type": "tool_use", "id": call.id, "name": function.name, "input": input}),
+                json!({"type": "tool_use", "id": crate::tool_ids::portable(&call.id), "name": function.name, "input": input}),
             );
         }
     }
@@ -1036,6 +1036,32 @@ mod tests {
         );
         assert_eq!(content[2]["type"], "text");
         assert_eq!(content.as_array().unwrap().len(), 3, "{content}");
+    }
+
+    #[test]
+    fn another_providers_tool_ids_reach_claude_in_the_characters_it_takes() {
+        // Kimi through OpenRouter names its calls `functions.read:0`; Anthropic
+        // refuses the request unless every id matches ^[a-zA-Z0-9_-]+$.
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "claude-haiku-4-5",
+            "messages": [
+                {"role":"user","content":"read it"},
+                {"role":"assistant","tool_calls":[{"id":"functions.read:0","type":"function",
+                    "function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]},
+                {"role":"tool","tool_call_id":"functions.read:0","content":"hello"},
+                {"role":"assistant","tool_calls":[{"id":"toolu_01Ab-9","type":"function",
+                    "function":{"name":"read","arguments":"{\"path\":\"b.txt\"}"}}]},
+                {"role":"tool","tool_call_id":"toolu_01Ab-9","content":"again"}
+            ]
+        }))
+        .unwrap();
+        let body = anthropic_request("claude-haiku-4-5", &request).unwrap();
+        let messages = &body["messages"];
+        assert_eq!(messages[1]["content"][0]["id"], "functions_read_0");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "functions_read_0");
+        // Claude's own ids are sent as they are.
+        assert_eq!(messages[3]["content"][0]["id"], "toolu_01Ab-9");
+        assert_eq!(messages[4]["content"][0]["tool_use_id"], "toolu_01Ab-9");
     }
 
     #[test]

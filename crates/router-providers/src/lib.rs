@@ -6,6 +6,7 @@ mod models;
 mod openai_compatible;
 mod openai_responses;
 mod sse;
+mod tool_ids;
 mod transport;
 
 use std::{collections::HashMap, sync::Arc};
