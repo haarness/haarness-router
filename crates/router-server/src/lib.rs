@@ -173,11 +173,8 @@ async fn handle_chat(
         Err(failure) => {
             log.labels = failure.labels;
             log.attempts = failure.attempts;
-            log.upstream_request_id = failure
-                .error
-                .upstream_request_id
-                .as_deref()
-                .map(str::to_owned);
+            log.upstream_request_id = failure.error.upstream_request_id().map(str::to_owned);
+            log.upstream_detail = failure.error.upstream_detail().map(str::to_owned);
             return Err(failure.error);
         }
     };
@@ -239,6 +236,7 @@ async fn handle_chat(
             Err(error) => {
                 state.metrics.error();
                 guard.http_status = Some(error.status);
+                guard.log.upstream_detail = error.upstream_detail().map(str::to_owned);
                 guard.finish(CompletionStatus::Failed, Some(&error.body.code));
                 Ok(api_error(error, &log.request_id))
             }
@@ -428,6 +426,7 @@ fn streaming_response(
                 Err(error) => {
                     metrics.error();
                     failure = Some(error.body.code.clone());
+                    guard.log.upstream_detail = error.upstream_detail().map(str::to_owned);
                     serde_json::to_value(error.envelope()).unwrap_or_else(|_| json!({
                         "error": {"message":"stream failed","type":"upstream_error","code":"stream_error"}
                     }))
@@ -792,7 +791,9 @@ fn unix_timestamp() -> u64 {
 
 /// One request's INFO summary line. Every field is a router ID, a validated
 /// caller or provider ID, or a configuration label: never a prompt, header
-/// value, credential, or the model string the client sent.
+/// value, credential, or the model string the client sent. A failed
+/// request also carries the provider's own explanation, scrubbed of quoted
+/// text, numbers and secret-shaped words (`router_core::detail`).
 #[derive(Clone)]
 struct RequestLog {
     request_id: String,
@@ -801,6 +802,7 @@ struct RequestLog {
     labels: Option<RouteLabels>,
     attempts: usize,
     upstream_request_id: Option<String>,
+    upstream_detail: Option<String>,
 }
 
 impl RequestLog {
@@ -812,6 +814,7 @@ impl RequestLog {
             labels: None,
             attempts: 0,
             upstream_request_id: None,
+            upstream_detail: None,
         }
     }
 
@@ -828,6 +831,7 @@ impl RequestLog {
             error_code,
             fallbacks = self.attempts.saturating_sub(1),
             upstream_request_id = self.upstream_request_id.as_deref(),
+            upstream_detail = self.upstream_detail.as_deref(),
             duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "request finished"
         );

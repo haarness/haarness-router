@@ -121,6 +121,19 @@ impl CircuitBreaker {
         }
     }
 
+    /// How long an open circuit keeps refusing before it lets a probe
+    /// through; `None` when it is closed.
+    #[must_use]
+    pub fn reopens_in(&self) -> Option<Duration> {
+        let state = self.state.lock().expect("circuit lock poisoned");
+        let opened_at = state.opened_at?;
+        Some(
+            self.cooldown
+                .saturating_sub(opened_at.elapsed())
+                .max(Duration::from_secs(1)),
+        )
+    }
+
     #[must_use]
     pub fn state(&self) -> CircuitState {
         let state = self.state.lock().expect("circuit lock poisoned");

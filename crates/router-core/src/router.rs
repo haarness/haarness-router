@@ -574,9 +574,7 @@ impl Router {
                 continue;
             }
             let Some(circuit_permit) = runtime.breaker.allow() else {
-                last_retryable = Some(RouterError::unavailable(format!(
-                    "circuit is open for {target}"
-                )));
+                last_retryable = Some(resting(&runtime.breaker));
                 continue;
             };
             progress.attempts += 1;
@@ -607,6 +605,8 @@ impl Router {
                     "provider {} did not produce response headers before the deadline", runtime.provider,
                 )).with_upstream_failure(UpstreamFailure::Timeout))),
             };
+            let own_key = upstream_override.is_none();
+            let result = result.map_err(|error| for_key(error, own_key));
             // Only failures the provider transport classified reached the
             // provider; translation and attachment errors are not counted.
             if let Err(error) = &result
@@ -619,6 +619,13 @@ impl Router {
                 upstream_request_id,
             } = match result {
                 Ok(stream) => stream,
+                Err(error) if own_key && error.is_out_of_credit() => {
+                    // Every request fails this way, and quickly, until the
+                    // account is topped up: an open circuit would only hide why.
+                    runtime.breaker.cancel(circuit_permit);
+                    last_retryable = Some(error);
+                    continue;
+                }
                 Err(error)
                     if error.retryable && !error.ambiguous && upstream_override.is_none() =>
                 {
@@ -644,6 +651,8 @@ impl Router {
                 },
                 first = tokio::time::timeout_at(deadline, stream.next()) => first,
             };
+            let first = first
+                .map(|first| first.map(|first| first.map_err(|error| for_key(error, own_key))));
             let failure = match &first {
                 Ok(Some(Ok(_))) => None,
                 Ok(Some(Err(error))) => Some(stream_failure(error)),
@@ -655,13 +664,18 @@ impl Router {
             }
             // The provider's ID arrived with the headers; keep it on failures.
             let with_request_id = |mut error: RouterError| {
-                if error.upstream_request_id.is_none() {
-                    error.upstream_request_id = upstream_request_id.as_deref().map(Box::from);
+                if error.upstream_request_id().is_none() {
+                    error = error.with_upstream_request_id(upstream_request_id.clone());
                 }
                 error
             };
             let first = match first {
                 Ok(Some(Ok(event))) => event,
+                Ok(Some(Err(error))) if own_key && error.is_out_of_credit() => {
+                    runtime.breaker.cancel(circuit_permit);
+                    last_retryable = Some(with_request_id(error));
+                    continue;
+                }
                 Ok(Some(Err(error)))
                     if error.retryable && !error.ambiguous && upstream_override.is_none() =>
                 {
@@ -773,6 +787,44 @@ impl Router {
 /// The class of a failure after the provider accepted the request. Transport
 /// errors and idle deadlines classify themselves; anything else (a broken,
 /// malformed, or error-reporting stream) is `Other`.
+/// What the router's users read when the provider account behind the
+/// router's own key has no credit left: they can't top it up themselves.
+pub const OWN_ACCOUNT_OUT_OF_CREDIT: &str = "This router's account with the provider has run out of credit, so this model can't answer until the account is topped up. Choose a model from another provider meanwhile.";
+
+/// A provider's refusal worded for whoever holds the key it refused. A
+/// caller's own key keeps the provider transport's words; the router's own
+/// key is not theirs to top up or re-plan.
+fn for_key(mut error: RouterError, own_key: bool) -> RouterError {
+    if !own_key {
+        return error;
+    }
+    if error.is_out_of_credit() {
+        error.status = http::StatusCode::SERVICE_UNAVAILABLE;
+        error.body.message = OWN_ACCOUNT_OUT_OF_CREDIT.into();
+        // Another target of an alias may well answer.
+        error.retryable = true;
+    } else if let Some(rest) = error
+        .body
+        .message
+        .strip_prefix("The provider is rate limiting this key.")
+    {
+        error.body.message = format!("The provider is rate limiting the router's key.{rest}");
+    }
+    error
+}
+
+/// The refusal while a target's circuit is open: its last requests failed in
+/// a row, so the router holds the next ones back until the cooldown ends.
+fn resting(breaker: &CircuitBreaker) -> RouterError {
+    let wait = breaker.reopens_in().map_or(1, |wait| wait.as_secs().max(1));
+    let mut error = RouterError::unavailable(format!(
+        "This model's provider failed several requests in a row, so the router is holding requests to it for a moment. Try again in {wait} seconds, or choose another model."
+    ));
+    error.retry_after_secs =
+        std::num::NonZeroU16::new(u16::try_from(wait).unwrap_or(u16::MAX).max(1));
+    error
+}
+
 fn stream_failure(error: &RouterError) -> UpstreamFailure {
     error.upstream_failure.unwrap_or(UpstreamFailure::Other)
 }
@@ -1553,5 +1605,182 @@ mod tests {
         assert!(store.runtime_keys()[0].last_used_at.is_some());
         assert!(store.remove_runtime_key("key_1"));
         assert!(!store.authenticate("runtime-secret"));
+    }
+
+    /// A provider refusing because its account has no credit: the router's
+    /// own key reads as the router's account (and an alias moves on to its
+    /// next target), a caller's own key as theirs, and no circuit opens to
+    /// hide why every request fails.
+    #[tokio::test]
+    async fn an_account_out_of_credit_is_named_for_whoever_holds_the_key() {
+        use super::*;
+        struct Broke;
+        #[async_trait]
+        impl ProviderAdapter for Broke {
+            async fn stream(
+                &self,
+                model: &str,
+                _: ChatCompletionRequest,
+                _: crate::Capabilities,
+                _: Option<&SecretString>,
+                _: CancellationToken,
+            ) -> Result<EventStream, RouterError> {
+                if model == "broke" {
+                    return Err(RouterError::new(
+                        http::StatusCode::PAYMENT_REQUIRED,
+                        "The provider account behind this key has run out of credit.",
+                        "upstream_error",
+                        crate::PROVIDER_OUT_OF_CREDIT,
+                    )
+                    .with_upstream_detail(Some("Your credit balance is too low".into())));
+                }
+                Ok(Box::pin(futures::stream::iter([Ok(
+                    ProviderEvent::TextDelta {
+                        index: 0,
+                        text: "ok".into(),
+                    },
+                )])))
+            }
+        }
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "first": {"kind": "openai-compatible", "base_url": "https://first.test/v1"},
+                "second": {"kind": "openai-compatible", "base_url": "https://second.test/v1"}
+            },
+            "aliases": {"steady": {"targets": ["first/broke", "second/fine"]}}
+        }))
+        .unwrap();
+        let adapters = HashMap::from([
+            ("first".into(), Arc::new(Broke) as Arc<dyn ProviderAdapter>),
+            ("second".into(), Arc::new(Broke) as Arc<dyn ProviderAdapter>),
+        ]);
+        let router = Router::with_provider_keys(
+            config,
+            adapters,
+            HashMap::from([
+                ("first".into(), SecretString::from("router-key")),
+                ("second".into(), SecretString::from("router-key")),
+            ]),
+        )
+        .unwrap();
+        let request = |model: &str| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": model, "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap()
+        };
+        for _ in 0..6 {
+            let error = router
+                .route(request("first/broke"), None, CancellationToken::new())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.status, http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error.body.code, crate::PROVIDER_OUT_OF_CREDIT);
+            assert_eq!(error.body.message, OWN_ACCOUNT_OUT_OF_CREDIT);
+            assert_eq!(
+                error.upstream_detail(),
+                Some("Your credit balance is too low")
+            );
+        }
+        assert!(
+            router
+                .circuit_states()
+                .iter()
+                .all(|(_, state)| *state == CircuitState::Closed),
+            "{:?}",
+            router.circuit_states()
+        );
+        let answered = router
+            .route(request("steady"), None, CancellationToken::new())
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(
+            (answered.provider.as_str(), answered.attempts),
+            ("second", 2)
+        );
+        let error = router
+            .route(
+                request("first/broke"),
+                Some(SecretString::from("customer-key")),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.status, http::StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            error.body.message,
+            "The provider account behind this key has run out of credit."
+        );
+    }
+
+    /// An open circuit says what happened and when to try again, and sends
+    /// that wait as `Retry-After`.
+    #[tokio::test]
+    async fn an_open_circuit_says_when_to_try_again() {
+        use super::*;
+        struct Down;
+        #[async_trait]
+        impl ProviderAdapter for Down {
+            async fn stream(
+                &self,
+                _: &str,
+                _: ChatCompletionRequest,
+                _: crate::Capabilities,
+                _: Option<&SecretString>,
+                _: CancellationToken,
+            ) -> Result<EventStream, RouterError> {
+                Err(RouterError::upstream(
+                    http::StatusCode::BAD_GATEWAY,
+                    "upstream returned HTTP 502",
+                ))
+            }
+        }
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "providers": {"down": {"kind": "openai-compatible", "base_url": "https://down.test/v1"}}
+        }))
+        .unwrap();
+        let router = Router::with_provider_keys(
+            config,
+            HashMap::from([("down".into(), Arc::new(Down) as Arc<dyn ProviderAdapter>)]),
+            HashMap::from([("down".into(), SecretString::from("router-key"))]),
+        )
+        .unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "down/model", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        for _ in 0..3 {
+            let error = router
+                .route(request.clone(), None, CancellationToken::new())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.body.code, "upstream_502");
+        }
+        let error = router
+            .route(request, None, CancellationToken::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.status, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error
+                .body
+                .message
+                .starts_with("This model's provider failed several requests in a row"),
+            "{}",
+            error.body.message
+        );
+        let wait: u64 = error.retry_after_header().unwrap().parse().unwrap();
+        assert!((1..=30).contains(&wait), "{wait}");
+        assert!(
+            error
+                .body
+                .message
+                .contains(&format!("Try again in {wait} seconds"))
+        );
     }
 }

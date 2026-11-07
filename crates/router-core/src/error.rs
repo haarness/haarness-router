@@ -14,14 +14,26 @@ pub struct RouterError {
     /// How a provider call failed, when its transport could tell. Never sent
     /// to clients; it labels the upstream failure counter.
     pub upstream_failure: Option<UpstreamFailure>,
-    /// The provider's own request ID for the failed call. Logged, never sent;
-    /// boxed so the `Err` of nearly every result stays small.
-    pub upstream_request_id: Option<Box<str>>,
+    /// What the provider said about the failed call: its own request ID and
+    /// its explanation. Logged and kept for operators, never sent; boxed so
+    /// the `Err` of nearly every result stays small.
+    upstream: Option<Box<Upstream>>,
     /// How many seconds the provider asked callers to wait (its
     /// `Retry-After`, at most about 18 hours), sent on as this response's own
     /// `Retry-After`. Two bytes keep the `Err` of nearly every result small.
     pub retry_after_secs: Option<std::num::NonZeroU16>,
 }
+
+#[derive(Debug, Clone, Default)]
+struct Upstream {
+    request_id: Option<String>,
+    /// Scrubbed by [`crate::detail::scrub`].
+    detail: Option<String>,
+}
+
+/// The code of a refusal because the provider account behind the key has no
+/// credit left (or too little for the request).
+pub const PROVIDER_OUT_OF_CREDIT: &str = "provider_out_of_credit";
 
 impl RouterError {
     #[must_use]
@@ -42,7 +54,7 @@ impl RouterError {
             retryable: false,
             ambiguous: false,
             upstream_failure: None,
-            upstream_request_id: None,
+            upstream: None,
             retry_after_secs: None,
         }
     }
@@ -85,7 +97,7 @@ impl RouterError {
             retryable,
             ambiguous: false,
             upstream_failure: None,
-            upstream_request_id: None,
+            upstream: None,
             retry_after_secs: None,
         }
     }
@@ -103,7 +115,7 @@ impl RouterError {
             retryable: !ambiguous,
             ambiguous,
             upstream_failure: None,
-            upstream_request_id: None,
+            upstream: None,
             retry_after_secs: None,
         }
     }
@@ -133,6 +145,45 @@ impl RouterError {
     pub fn with_upstream_failure(mut self, failure: UpstreamFailure) -> Self {
         self.upstream_failure = Some(failure);
         self
+    }
+
+    /// Keeps the provider's own explanation, scrubbed, for operators.
+    #[must_use]
+    pub fn with_upstream_detail(mut self, detail: Option<String>) -> Self {
+        if detail.is_some() || self.upstream.is_some() {
+            self.upstream.get_or_insert_default().detail = detail;
+        }
+        self
+    }
+
+    /// The provider's own explanation, scrubbed: for logs and operators'
+    /// records, never for clients.
+    #[must_use]
+    pub fn upstream_detail(&self) -> Option<&str> {
+        self.upstream.as_ref()?.detail.as_deref()
+    }
+
+    /// Keeps the provider's own ID for the failed call, for logs.
+    #[must_use]
+    pub fn with_upstream_request_id(mut self, request_id: Option<String>) -> Self {
+        if request_id.is_some() || self.upstream.is_some() {
+            self.upstream.get_or_insert_default().request_id = request_id;
+        }
+        self
+    }
+
+    /// The provider's own ID for the failed call: logged, never sent.
+    #[must_use]
+    pub fn upstream_request_id(&self) -> Option<&str> {
+        self.upstream.as_ref()?.request_id.as_deref()
+    }
+
+    /// Whether the provider refused because the account behind the key has
+    /// no credit left: waiting does not help, adding credit or another
+    /// provider does.
+    #[must_use]
+    pub fn is_out_of_credit(&self) -> bool {
+        self.body.code == PROVIDER_OUT_OF_CREDIT
     }
 
     /// The `Retry-After` header value for this error's response, in whole seconds.

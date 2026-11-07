@@ -2057,3 +2057,68 @@ async fn reasoning_that_arrives_with_its_details_reaches_clients_once() {
         "{whole}"
     );
 }
+
+/// A provider account out of credit (Anthropic refuses with a 400) reads as
+/// the router's account when the router's own key was refused, so the
+/// caller knows topping it up is not theirs to do, and as the caller's when
+/// their key was. Neither answer carries the provider's body.
+#[tokio::test]
+async fn an_account_out_of_credit_is_named_for_whoever_holds_the_key() {
+    async fn broke() -> Response {
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("request-id", "req_upstream_credit")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_upstream_credit"}"#,
+            ))
+            .unwrap()
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, AxumRouter::new().route("/messages", post(broke)))
+            .await
+            .unwrap();
+    });
+    let config = config(BTreeMap::from([(
+        "anthropic".into(),
+        native_provider(ProviderKind::Anthropic, format!("http://{address}")),
+    )]));
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(
+        config,
+        adapters,
+        HashMap::from([("anthropic".into(), SecretString::from("router-own-key"))]),
+    )
+    .unwrap();
+    let app = router_server::app(router_server::AppState::new(
+        router,
+        AuthStore::from_keys(["router-secret"], true),
+    ));
+    let body = serde_json::json!({"model":"anthropic/claude-test","messages":[{"role":"user","content":"hello"}],"max_tokens":10,"stream":true});
+    let mut own = json_chat_request(body.clone());
+    own.headers_mut().remove("x-upstream-api-key");
+    for (request, status, message) in [
+        (
+            own,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This router's account with the provider has run out of credit, so this model can't answer until the account is topped up. Choose a model from another provider meanwhile.",
+        ),
+        (
+            json_chat_request(body),
+            StatusCode::PAYMENT_REQUIRED,
+            "The provider account behind this key has run out of credit, so the provider refused the request. Add credit with the provider, or use another key or provider.",
+        ),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "provider_out_of_credit");
+        assert_eq!(body["error"]["message"], message);
+        assert!(!body.to_string().contains("Plans & Billing"), "{body}");
+    }
+    server.abort();
+}

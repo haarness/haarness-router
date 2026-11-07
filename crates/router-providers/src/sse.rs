@@ -105,6 +105,13 @@ pub async fn checked_response(
         bytes.extend_from_slice(&chunk);
     }
     let retry_after = response_retry_after(response.headers());
+    let detail = router_core::detail::from_error_body(&bytes);
+    if out_of_credit(status, &String::from_utf8_lossy(&bytes)) {
+        return Err(out_of_credit_error()
+            .with_upstream_failure(UpstreamFailure::from_status(status))
+            .with_upstream_detail(detail)
+            .with_upstream_request_id(upstream_request_id));
+    }
     let upstream_code = serde_json::from_slice::<Value>(&bytes)
         .ok()
         .and_then(|value| {
@@ -126,8 +133,9 @@ pub async fn checked_response(
             )
         });
     let mut error = RouterError::upstream(status, message)
-        .with_upstream_failure(UpstreamFailure::from_status(status));
-    error.upstream_request_id = upstream_request_id.map(String::into_boxed_str);
+        .with_upstream_failure(UpstreamFailure::from_status(status))
+        .with_upstream_detail(detail)
+        .with_upstream_request_id(upstream_request_id);
     // A wait helps only when the provider is busy, not with a request it will never take.
     error.retry_after_secs = retry_after
         .filter(|_| matches!(status.as_u16(), 429 | 503))
@@ -135,6 +143,95 @@ pub async fn checked_response(
             std::num::NonZeroU16::new(u16::try_from(wait.as_secs().max(1)).unwrap_or(u16::MAX))
         });
     Err(error)
+}
+
+/// What a key's owner reads when the provider account behind the key has no
+/// credit left. A router refused on its own key says so in its own words
+/// (`Router` rewrites this).
+pub const OUT_OF_CREDIT: &str = "The provider account behind this key has run out of credit, so the provider refused the request. Add credit with the provider, or use another key or provider.";
+
+fn out_of_credit_error() -> RouterError {
+    RouterError::new(
+        http::StatusCode::PAYMENT_REQUIRED,
+        OUT_OF_CREDIT,
+        "upstream_error",
+        router_core::PROVIDER_OUT_OF_CREDIT,
+    )
+}
+
+/// Whether a provider refused because the account behind the key has no
+/// credit, or too little for the request. Providers say it with different
+/// statuses: Anthropic 400, `OpenAI` 429 (`insufficient_quota`), `xAI` 403,
+/// `OpenRouter` and `DeepSeek` 402. Waiting never clears it.
+fn out_of_credit(status: http::StatusCode, body: &str) -> bool {
+    if status == http::StatusCode::PAYMENT_REQUIRED {
+        return true;
+    }
+    if !matches!(status.as_u16(), 400 | 403 | 429) {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    [
+        "credit balance is too low",
+        "insufficient_quota",
+        "insufficient balance",
+        "insufficient credits",
+        "used all available credits",
+        "requires more credits",
+    ]
+    .iter()
+    .any(|words| lower.contains(words))
+}
+
+/// An error event a provider sent inside its stream (`{"error": {...}}`):
+/// `OpenRouter` sends the serving provider's HTTP status as a number, others a
+/// string code. A refusal keeps its status, so a rate limit reads and backs
+/// off as one and a request the provider will never take is not tried again.
+pub fn stream_error(event: &Value) -> RouterError {
+    let error = event.get("error").unwrap_or(event);
+    let detail = router_core::detail::from_error_value(event);
+    let numeric = error
+        .get("code")
+        .and_then(|code| {
+            code.as_u64()
+                .or_else(|| code.as_str().and_then(|code| code.parse().ok()))
+        })
+        .and_then(|code| u16::try_from(code).ok())
+        .and_then(|code| http::StatusCode::from_u16(code).ok())
+        .filter(|status| status.is_client_error() || status.is_server_error());
+    let named = error
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|code| code.parse::<u16>().is_err())
+        .map(sanitize_code)
+        .filter(|code| !code.is_empty());
+    let raw = event.to_string();
+    let status = numeric.unwrap_or(if named.as_deref() == Some("rate_limit_exceeded") {
+        http::StatusCode::TOO_MANY_REQUESTS
+    } else {
+        http::StatusCode::BAD_GATEWAY
+    });
+    if out_of_credit(status, &raw) || named.as_deref() == Some("insufficient_quota") {
+        return out_of_credit_error()
+            .with_upstream_failure(UpstreamFailure::Other)
+            .with_upstream_detail(detail);
+    }
+    let (status, message) = match (status.as_u16(), named) {
+        (429, _) => plain_refusal(status, &raw, None)
+            .unwrap_or_else(|| (status, "upstream stream reported a rate limit".to_owned())),
+        (_, Some(code)) => (status, format!("upstream stream reported {code}")),
+        _ if numeric.is_some() => (
+            status,
+            format!("upstream stream reported HTTP {}", status.as_u16()),
+        ),
+        _ => (
+            status,
+            "upstream stream reported upstream_stream_error".to_owned(),
+        ),
+    };
+    RouterError::upstream(status, message)
+        .with_upstream_failure(UpstreamFailure::Other)
+        .with_upstream_detail(detail)
 }
 
 /// A provider's `Retry-After` in seconds, up to a day. An HTTP date is not read.
@@ -320,6 +417,110 @@ mod tests {
         );
         assert!(plain_refusal(http::StatusCode::NOT_FOUND, "{}", None).is_none());
         assert!(plain_refusal(http::StatusCode::BAD_REQUEST, groq, None).is_none());
+    }
+
+    #[test]
+    fn an_account_out_of_credit_reads_the_same_from_every_provider() {
+        use super::{OUT_OF_CREDIT, out_of_credit, stream_error};
+        let refusals = [
+            (
+                400,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}"#,
+            ),
+            (
+                402,
+                r#"{"error":{"message":"Insufficient credits. Add more using https://openrouter.ai/settings/credits","code":402}}"#,
+            ),
+            (
+                402,
+                r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 32768 tokens, but can only afford 811.","code":402}}"#,
+            ),
+            (
+                402,
+                r#"{"error":{"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}"#,
+            ),
+            (
+                403,
+                r#"{"code":"The caller does not have permission to execute the specified operation","error":"Your team has either used all available credits or reached its monthly spending limit."}"#,
+            ),
+        ];
+        for (status, body) in refusals {
+            assert!(
+                out_of_credit(http::StatusCode::from_u16(status).unwrap(), body),
+                "{status} {body}"
+            );
+        }
+        // A rate limit, a per-minute quota and a plain bad request are not.
+        for (status, body) in [
+            (
+                429,
+                r#"{"error":{"message":"Rate limit reached for requests","type":"requests","code":"rate_limit_exceeded"}}"#,
+            ),
+            (
+                429,
+                r#"{"error":{"code":429,"message":"You exceeded your current quota. Quota exceeded for metric: generate_content_free_tier_requests, limit: 15","status":"RESOURCE_EXHAUSTED"}}"#,
+            ),
+            (
+                400,
+                r#"{"error":{"type":"invalid_request_error","message":"max_tokens: 64001 > 64000"}}"#,
+            ),
+            (
+                500,
+                r#"{"error":{"message":"insufficient credits on the backend"}}"#,
+            ),
+        ] {
+            assert!(
+                !out_of_credit(http::StatusCode::from_u16(status).unwrap(), body),
+                "{status} {body}"
+            );
+        }
+        let event = serde_json::json!({"error":{"code":402,"message":"Insufficient credits"}});
+        let error = stream_error(&event);
+        assert!(error.is_out_of_credit());
+        assert_eq!(error.body.message, OUT_OF_CREDIT);
+    }
+
+    #[test]
+    fn an_error_inside_a_stream_keeps_its_status_and_the_providers_words() {
+        use super::stream_error;
+        // OpenRouter passes the serving provider's status on as a number.
+        let busy = serde_json::json!({"error":{"code":429,"message":"deepseek/deepseek-chat is temporarily rate-limited upstream. Please retry shortly.","metadata":{"provider_name":"DeepSeek"}}});
+        let error = stream_error(&busy);
+        assert_eq!(error.status, http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.retryable);
+        assert_eq!(
+            error.body.message,
+            "The provider is rate limiting this key. Try again shortly."
+        );
+        assert_eq!(
+            error.upstream_detail(),
+            Some(
+                "deepseek/deepseek-chat is temporarily rate-limited upstream. Please retry shortly. (DeepSeek)"
+            )
+        );
+        let refused = serde_json::json!({"error":{"code":400,"message":"Provider returned error","metadata":{"raw":"{\"message\":\"invalid tool call\"}","provider_name":"Cohere"}}});
+        let error = stream_error(&refused);
+        assert_eq!(error.status, http::StatusCode::BAD_REQUEST);
+        assert!(!error.retryable);
+        assert_eq!(error.body.message, "upstream stream reported HTTP 400");
+        assert_eq!(
+            error.upstream_detail(),
+            Some("Provider returned error (Cohere: invalid tool call)")
+        );
+        let named = serde_json::json!({"error":{"code":"server_error","message":"The server had an error"}});
+        let error = stream_error(&named);
+        assert_eq!(error.status, http::StatusCode::BAD_GATEWAY);
+        assert!(error.retryable);
+        assert_eq!(error.body.message, "upstream stream reported server_error");
+        let bare = serde_json::json!({"error":{"message":"something broke"}});
+        assert_eq!(
+            stream_error(&bare).body.message,
+            "upstream stream reported upstream_stream_error"
+        );
     }
 
     #[test]
