@@ -597,10 +597,20 @@ fn o_series(family: &str) -> Option<u32> {
 
 /// GPT-5 and later, and o4 and later, read images and call tools; a new
 /// generation is taken to do the same until its catalog entry says otherwise.
+/// So do GPT-4o, GPT-4.1 and GPT-4 Turbo, and o1 and o3 but not their mini or
+/// preview models. GPT-4 itself and GPT-3.5 read only text.
 fn openai_reads_images(id: &str) -> bool {
     let family = openai_family(id);
-    gpt_version(&family).is_some_and(|(major, _)| major >= 5)
-        || o_series(&family).is_some_and(|number| number >= 4)
+    if let Some((major, minor)) = gpt_version(&family) {
+        return major >= 5
+            || (major == 4
+                && (minor.is_some_and(|minor| minor >= 1)
+                    || family.starts_with("gpt-4o")
+                    || names(&family, "turbo")));
+    }
+    o_series(&family).is_some_and(|number| {
+        number >= 4 || (!names(&family, "mini") && !names(&family, "preview"))
+    })
 }
 
 /// Reasoning tiers the public Responses API accepts per `OpenAI` model family,
@@ -880,6 +890,38 @@ mod tests {
         // o3-mini reads no images; nothing is claimed for it.
         let o3 = model_entry(&config, &json!({"id":"o3-mini"})).unwrap();
         assert!(!o3.metadata.contains_key("supports_vision"));
+    }
+
+    #[test]
+    fn openai_models_that_read_images_say_so() {
+        let config: ProviderConfig = serde_json::from_value(json!({"kind":"openai"})).unwrap();
+        let vision = |id: &str| {
+            model_entry(&config, &json!({ "id": id }))
+                .unwrap()
+                .metadata
+                .get("supports_vision")
+                .cloned()
+        };
+        for id in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4o-2024-11-20",
+            "gpt-4o-mini-2024-07-18",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4.1-nano",
+            "gpt-4-turbo",
+            "o1",
+            "o3",
+            "o3-pro",
+            "o4-mini",
+            "gpt-5-mini",
+        ] {
+            assert_eq!(vision(id), Some(json!(true)), "{id}");
+        }
+        for id in ["gpt-4", "gpt-4-0613", "gpt-3.5-turbo", "o1-mini", "o3-mini"] {
+            assert_eq!(vision(id), None, "{id}");
+        }
     }
 
     #[test]
