@@ -551,6 +551,202 @@ async fn a_refused_forced_tool_call_is_asked_once_more_unforced() {
     assert_eq!(bodies[1]["tool_choice"], serde_json::json!({"type":"auto"}));
 }
 
+/// What Anthropic says about a thinking block whose conversation changed since
+/// Claude wrote it, when the request could not ask it to retire the block.
+const BOUND_ELSEWHERE: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.1: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header. This request has content before this block that was not present when it was created, first at `messages.1.content.0`."}}"#;
+
+fn has_thinking(body: &serde_json::Value) -> bool {
+    body["messages"].as_array().unwrap().iter().any(|message| {
+        message["content"].as_array().is_some_and(|content| {
+            content.iter().any(|block| {
+                matches!(
+                    block["type"].as_str(),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        })
+    })
+}
+
+async fn anthropic_app(
+    handler: axum::routing::MethodRouter<NativeMockState>,
+) -> (AxumRouter, NativeMockState) {
+    let state = NativeMockState::default();
+    let application = AxumRouter::new()
+        .route("/messages", handler)
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, application).await.unwrap() });
+    let config = config(BTreeMap::from([(
+        "anthropic".into(),
+        native_provider(ProviderKind::Anthropic, format!("http://{address}")),
+    )]));
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(config, adapters, HashMap::new()).unwrap();
+    let app = router_server::app(router_server::AppState::new(
+        router,
+        AuthStore::from_keys(["router-secret"], true),
+    ));
+    (app, state)
+}
+
+/// A chat as Haarness sends it after Claude thought, said what it would do
+/// and called a tool: the words and the call as two assistant messages, the
+/// thinking on the call.
+fn chat_after_a_call(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role":"user", "content":"fix the date bug"},
+            {"role":"assistant", "content":"I'll read the date module first."},
+            {"role":"assistant", "content":null, "tool_calls":[{"id":"toolu_1","type":"function",
+                "function":{"name":"read","arguments":"{\"path\":\"src/date.rs\"}"}}],
+             "reasoning_details":[{"type":"reasoning.text","text":"","signature":"signed",
+                "format":"anthropic-claude-v1","index":0}]},
+            {"role":"tool", "tool_call_id":"toolu_1", "content":"fn month() {}"}
+        ],
+        "tools": [{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}],
+        "max_completion_tokens": 64
+    })
+}
+
+#[tokio::test]
+async fn claude_gets_its_turn_back_as_it_wrote_it_with_its_thinking_bound() {
+    async fn records(
+        State(state): State<NativeMockState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        state.credentials.lock().unwrap().push(beta.to_owned());
+        state.bodies.lock().unwrap().push(body);
+        mock_anthropic(
+            State(NativeMockState::default()),
+            headers,
+            Json(serde_json::json!({})),
+        )
+        .await
+    }
+    let (app, state) = anthropic_app(post(records)).await;
+    // No reasoning asked for: Claude Opus 5.5 thinks anyway.
+    let response = app
+        .oneshot(json_chat_request(chat_after_a_call(
+            "anthropic/claude-opus-5-5",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bodies = state.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let messages = bodies[0]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3, "the words and the call are one turn");
+    let turn: Vec<_> = messages[1]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(turn, ["thinking", "text", "tool_use"]);
+    assert_eq!(
+        bodies[0]["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+        "drop_block"
+    );
+    assert_eq!(
+        state.credentials.lock().unwrap().as_slice(),
+        ["thinking-binding-controls-2026-08-01"]
+    );
+}
+
+#[tokio::test]
+async fn thinking_bound_to_another_conversation_is_left_out_once_and_claude_answers() {
+    async fn refuses_thinking(
+        State(state): State<NativeMockState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        if has_thinking(&body) {
+            state.bodies.lock().unwrap().push(body);
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(BOUND_ELSEWHERE))
+                .unwrap();
+        }
+        mock_anthropic(State(state), headers, Json(body)).await
+    }
+    let (app, state) = anthropic_app(post(refuses_thinking)).await;
+    // Thinking off: Anthropic cannot be asked to retire stale blocks.
+    let mut chat = chat_after_a_call("anthropic/claude-haiku-5-5");
+    chat["reasoning_effort"] = serde_json::json!("none");
+    let response = app.oneshot(json_chat_request(chat)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "claude");
+    let bodies = state.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert!(has_thinking(&bodies[0]));
+    assert!(!has_thinking(&bodies[1]));
+    assert_eq!(
+        bodies[1]["thinking"],
+        serde_json::json!({"type":"disabled"})
+    );
+    // The words and the call stay.
+    assert_eq!(
+        bodies[1]["messages"][1]["content"],
+        serde_json::json!([
+            {"type":"text","text":"I'll read the date module first."},
+            {"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"src/date.rs"}}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn a_conversation_refused_again_without_its_thinking_is_not_asked_a_third_time() {
+    async fn refuses_otherwise(
+        State(state): State<NativeMockState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        state.bodies.lock().unwrap().push(body);
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#,
+            ))
+            .unwrap()
+    }
+    async fn always_refuses(
+        State(state): State<NativeMockState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        state.bodies.lock().unwrap().push(body);
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(BOUND_ELSEWHERE))
+            .unwrap()
+    }
+    let (app, state) = anthropic_app(post(always_refuses)).await;
+    let mut chat = chat_after_a_call("anthropic/claude-haiku-5-5");
+    chat["reasoning_effort"] = serde_json::json!("none");
+    let response = app.oneshot(json_chat_request(chat)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(state.bodies.lock().unwrap().len(), 2);
+
+    // Another refusal of the same request is not taken for this one.
+    let (app, state) = anthropic_app(post(refuses_otherwise)).await;
+    let mut chat = chat_after_a_call("anthropic/claude-haiku-5-5");
+    chat["reasoning_effort"] = serde_json::json!("none");
+    let response = app.oneshot(json_chat_request(chat)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(state.bodies.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn native_gemini_contract_is_isolated_behind_canonical_events() {
     let (base_url, upstream) = spawn_native_mock(ProviderKind::Gemini).await;

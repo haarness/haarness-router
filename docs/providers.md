@@ -177,6 +177,19 @@ rules follow the family and version in the id, so a newer Claude takes the rules
 When another model still answers 400 to a forced choice (as Claude does when thinking is on), the request
 is sent once more with `auto`.
 
+Claude Fable and Mythos from 5.1, and every Claude from 5.5, bind each thinking block to everything before it:
+a block replayed after an earlier message, tool result, system prompt or tool list changed is refused. These
+models think even when a request asks for no reasoning, so the adapter asks for summarized adaptive thinking and
+`thinking.block_binding.prefix_mismatch_behavior = "drop_block"` (with the `thinking-binding-controls-2026-08-01`
+beta) whether or not reasoning was requested: Anthropic then leaves a stale block out instead of refusing the
+conversation. Claude's thinking travels in `reasoning_details`, each with the `index` of its block in Claude's
+response. Consecutive assistant messages are sent as the one turn Anthropic makes of them, with each thinking
+block at its index, so a client that keeps the words before a call as their own message, ahead of the call that
+carries the thinking, gets the turn back in the order Claude wrote it; without usable indexes the thinking leads
+the turn. When Anthropic still refuses a block as bound to a different conversation (thinking turned off, where
+the binding cannot be sent), the request is sent once more without any thinking blocks; each turn's words and
+tool calls stay.
+
 Claude refuses a text block that is empty or only whitespace, so blank text parts are left out: a photo sent
 with an empty text part beside it reaches Claude as the photo alone. A data URL may carry parameters before
 `;base64` (`data:image/jpeg;name=photo.jpg;base64,…`); the media type is what comes before the first one.

@@ -70,7 +70,7 @@ impl ProviderAdapter for AnthropicAdapter {
         validate_nested_extensions(&request)?;
         prepare_pdf_fallback(&mut request, capabilities).await?;
         let key = api_key.ok_or_else(|| RouterError::unavailable("provider API key is missing"))?;
-        let body = anthropic_request(model, &request)?;
+        let mut body = anthropic_request(model, &request)?;
         let mut builder = self
             .transport
             .client()
@@ -80,26 +80,40 @@ impl ProviderAdapter for AnthropicAdapter {
         if body.pointer("/thinking/block_binding").is_some() {
             builder = builder.header("anthropic-beta", THINKING_BINDING_BETA);
         }
-        let retry = forces_tool(&body).then(|| builder.try_clone()).flatten();
-        let mut response = builder.json(&body).send().await.map_err(request_error)?;
-        // A model these rules do not know to refuse a forced tool call may
-        // still answer 400 to it, as thinking does with any model. The refusal
-        // costs nothing; ask once more and let the model choose the tool.
-        if response.status() == http::StatusCode::BAD_REQUEST
-            && let Some(builder) = retry
-        {
-            let mut unforced = body.clone();
-            unforced["tool_choice"]["type"] = json!("auto");
-            if let Some(choice) = unforced["tool_choice"].as_object_mut() {
-                choice.remove("name");
+        let (mut unforced, mut unbound) = (false, false);
+        let response = loop {
+            let attempt = builder.try_clone().ok_or_else(|| {
+                RouterError::unavailable("the Anthropic request could not be prepared")
+            })?;
+            let response = attempt.json(&body).send().await.map_err(request_error)?;
+            let refused = response.status() == http::StatusCode::BAD_REQUEST;
+            let error = match self.transport.checked(response).await {
+                Ok(response) => break response,
+                Err(error) if refused => error,
+                Err(error) => return Err(error),
+            };
+            // Thinking that no longer matches its conversation, in a request
+            // that cannot ask Anthropic to retire it (thinking turned off, or
+            // a model these rules do not know binds its thinking), is refused
+            // before Claude answers. Claude answers without it instead: the
+            // refusal costs nothing, and the chat goes on.
+            if !unbound && bound_to_another_conversation(&error) && without_thinking(&mut body) {
+                unbound = true;
+                continue;
             }
-            response = builder
-                .json(&unforced)
-                .send()
-                .await
-                .map_err(request_error)?;
-        }
-        let response = self.transport.checked(response).await?;
+            // A model these rules do not know to refuse a forced tool call may
+            // still answer 400 to it, as thinking does with any model. The
+            // refusal costs nothing; ask once more and let the model choose the tool.
+            if !unforced && forces_tool(&body) {
+                unforced = true;
+                body["tool_choice"]["type"] = json!("auto");
+                if let Some(choice) = body["tool_choice"].as_object_mut() {
+                    choice.remove("name");
+                }
+                continue;
+            }
+            return Err(error);
+        };
         let upstream_request_id = upstream_request_id(response.headers());
         let mut source = self.transport.sse(response, cancel);
         let events = Box::pin(try_stream! {
@@ -264,6 +278,10 @@ fn anthropic_request(model: &str, request: &ChatCompletionRequest) -> Result<Val
     reject_unsupported_parameters(request)?;
     let mut system = Vec::new();
     let mut messages = Vec::new();
+    // Consecutive assistant messages are one turn to Claude, as Anthropic
+    // joins them; they are sent as that turn, with its thinking where Claude
+    // wrote it (see [`AssistantTurn`]).
+    let mut turn: Option<AssistantTurn> = None;
     for message in &request.messages {
         if matches!(message.role.as_str(), "system" | "developer") {
             let mut blocks = system_content_blocks(message)?;
@@ -271,7 +289,18 @@ fn anthropic_request(model: &str, request: &ChatCompletionRequest) -> Result<Val
             system.extend(blocks);
             continue;
         }
+        if message.role == "assistant" {
+            turn.get_or_insert_with(AssistantTurn::default)
+                .add(message)?;
+            continue;
+        }
+        if let Some(turn) = turn.take() {
+            messages.push(turn.finish());
+        }
         messages.push(anthropic_message(message)?);
+    }
+    if let Some(turn) = turn {
+        messages.push(turn.finish());
     }
     let tools = request
         .tools
@@ -423,12 +452,25 @@ fn claude_model(model: &str) -> Option<(String, (u64, u64))> {
 }
 
 /// Models whose thinking blocks stay valid only while everything before them is
-/// unchanged (Anthropic's preserved-thinking page, 2026-10-10): Fable from 5.1
-/// and every family from 5.5. A newer generation is taken to do the same.
+/// unchanged (Anthropic's preserved-thinking page, 2026-10-10): Fable and
+/// Mythos from 5.1 and every family from 5.5. A newer generation is taken to
+/// do the same. All of them think unasked.
 fn prefix_bound_thinking(model: &str) -> bool {
     claude_model(model).is_some_and(|(family, version)| {
-        version >= (5, 5) || (family == "fable" && version >= (5, 1))
+        version >= (5, 5) || (matches!(family.as_str(), "fable" | "mythos") && version >= (5, 1))
     })
+}
+
+/// Adaptive thinking that shows its summary and, on a model that binds its
+/// thinking to the conversation, retires blocks whose conversation changed
+/// (a cut tool result, a rebuilt turn) instead of failing it with a 400.
+fn adaptive_thinking(model: &str) -> Value {
+    // Without `display`, adaptive thinking comes back as empty blocks.
+    let mut thinking = json!({"type": "adaptive", "display": "summarized"});
+    if prefix_bound_thinking(model) {
+        thinking["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
+    }
+    thinking
 }
 
 /// Models that answer 400 to `tool_choice` `any` or `tool` (checked 2026-10-10):
@@ -440,6 +482,45 @@ fn rejects_forced_tool_choice(model: &str) -> bool {
         "fable" | "mythos" => version >= (5, 1),
         _ => version >= (5, 5),
     })
+}
+
+/// Whether Anthropic refused a thinking block because the conversation before
+/// it changed since Claude wrote it ("The block is bound to a different
+/// conversation"), as opposed to a signature it cannot read at all.
+fn bound_to_another_conversation(error: &RouterError) -> bool {
+    error.status == http::StatusCode::BAD_REQUEST
+        && error
+            .upstream_detail()
+            .is_some_and(|detail| detail.contains("bound to a different conversation"))
+}
+
+/// Takes every thinking block out of the conversation, keeping each turn's
+/// words and tool calls; a turn that was only thinking goes with it. Whether
+/// there was any to take.
+fn without_thinking(body: &mut Value) -> bool {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut removed = false;
+    for message in messages.iter_mut() {
+        if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+            let before = content.len();
+            content.retain(|block| {
+                !matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            });
+            removed |= content.len() != before;
+        }
+    }
+    messages.retain(|message| {
+        message["role"] != "assistant"
+            || message["content"]
+                .as_array()
+                .is_none_or(|content| !content.is_empty())
+    });
+    removed
 }
 
 /// Whether the body forces a tool call, which a model may refuse.
@@ -505,6 +586,11 @@ fn apply_anthropic_reasoning(
     body: &mut Value,
 ) -> Result<(), RouterError> {
     if request.reasoning.is_none() && request.reasoning_effort.is_none() {
+        // These models think when not asked to, and their blocks come back
+        // with the conversation: they are bound as when thinking is asked for.
+        if prefix_bound_thinking(model) && thinking_mode(model) == AnthropicThinkingMode::Adaptive {
+            body["thinking"] = adaptive_thinking(model);
+        }
         return Ok(());
     }
     let reasoning = request.reasoning.as_ref();
@@ -550,13 +636,7 @@ fn apply_anthropic_reasoning(
     }
 
     if mode == AnthropicThinkingMode::Adaptive {
-        // Without `display`, adaptive thinking comes back as empty blocks.
-        body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
-        if prefix_bound_thinking(model) {
-            // A changed prompt or tool list retires the invalidated thinking
-            // instead of failing the conversation with a 400.
-            body["thinking"]["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
-        }
+        body["thinking"] = adaptive_thinking(model);
         if let Some(effort) = effort {
             manual_effort_budget(effort)?;
             body["output_config"] = json!({"effort": effort});
@@ -612,39 +692,51 @@ fn anthropic_message(message: &Message) -> Result<Value, RouterError> {
             "messages.role",
         ));
     }
-    let role = if message.role == "assistant" {
-        "assistant"
-    } else {
-        "user"
-    };
-    let regular_content = content_blocks(message)?;
-    let mut content = if role == "assistant" {
-        Vec::new()
-    } else {
-        regular_content.clone()
-    };
-    if role == "assistant" {
+    // Assistant messages are sent as turns ([`AssistantTurn`]).
+    let mut content = content_blocks(message)?;
+    apply_message_cache_control(&mut content, message)?;
+    Ok(json!({"role": "user", "content": content}))
+}
+
+/// One assistant turn as Claude wrote it. OpenAI-style clients send a turn's
+/// words and its tool calls as one message or as two in a row (Haarness keeps
+/// the words before a call as their own message), and Claude's thinking rides
+/// on them as reasoning details. A Claude 5.5 thinking block is bound to
+/// everything before it, so it must come back where it was written: before
+/// the words that followed it, not after them. Each detail's `index` is the
+/// block's place in Claude's response; without usable indexes the thinking
+/// leads the turn, as a response's first thinking does.
+#[derive(Default)]
+struct AssistantTurn {
+    thinking: Vec<(Option<u64>, Value)>,
+    blocks: Vec<Value>,
+}
+
+impl AssistantTurn {
+    fn add(&mut self, message: &Message) -> Result<(), RouterError> {
         // Only Claude's own thinking goes back to Claude: another model's
         // reasoning in the same chat (DeepSeek's through OpenRouter, OpenAI's
         // encrypted items) has no Claude signature, and Anthropic refuses it.
+        let mut thinking = Vec::new();
         for detail in message
             .reasoning_details
             .iter()
             .filter(|detail| claude_reasoning(detail))
         {
-            match detail.get("type").and_then(Value::as_str) {
-                Some("reasoning.encrypted") => content.push(json!({
+            let block = match detail.get("type").and_then(Value::as_str) {
+                Some("reasoning.encrypted") => json!({
                     "type": "redacted_thinking", "data": detail.get("data").cloned().unwrap_or(Value::Null)
-                })),
-                Some("reasoning.text") => content.push(json!({
+                }),
+                Some("reasoning.text") => json!({
                     "type": "thinking",
                     "thinking": detail.get("text").and_then(Value::as_str).unwrap_or_default(),
                     "signature": detail.get("signature").and_then(Value::as_str).unwrap_or_default()
-                })),
-                _ => {}
-            }
+                }),
+                _ => continue,
+            };
+            thinking.push((detail.get("index").and_then(Value::as_u64), block));
         }
-        content.extend(regular_content);
+        let mut blocks = content_blocks(message)?;
         for call in &message.tool_calls {
             let function = call.function.as_ref().ok_or_else(|| {
                 RouterError::invalid(
@@ -658,13 +750,67 @@ fn anthropic_message(message: &Message) -> Result<Value, RouterError> {
                     "messages.tool_calls.function.arguments",
                 )
             })?;
-            content.push(
+            blocks.push(
                 json!({"type": "tool_use", "id": crate::tool_ids::portable(&call.id), "name": function.name, "input": input}),
             );
         }
+        // A message's cache marker goes on its last block, as for any message.
+        if let Some(last) = blocks.last_mut() {
+            apply_message_cache_control(std::slice::from_mut(last), message)?;
+        } else if let Some((_, last)) = thinking.last_mut() {
+            apply_message_cache_control(std::slice::from_mut(last), message)?;
+        } else {
+            apply_message_cache_control(&mut [], message)?;
+        }
+        self.thinking.extend(thinking);
+        self.blocks.extend(blocks);
+        Ok(())
     }
-    apply_message_cache_control(&mut content, message)?;
-    Ok(json!({"role": role, "content": content}))
+
+    fn finish(self) -> Value {
+        let total = self.thinking.len() + self.blocks.len();
+        let indexes = self
+            .thinking
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Option<Vec<_>>>()
+            .filter(|indexes| {
+                indexes.windows(2).all(|pair| pair[0] < pair[1])
+                    && indexes
+                        .last()
+                        .is_none_or(|last| usize::try_from(*last).is_ok_and(|last| last < total))
+            });
+        let Some(indexes) = indexes else {
+            let content: Vec<_> = self
+                .thinking
+                .into_iter()
+                .map(|(_, block)| block)
+                .chain(self.blocks)
+                .collect();
+            return json!({"role": "assistant", "content": content});
+        };
+        let mut thinking = self
+            .thinking
+            .into_iter()
+            .map(|(_, block)| block)
+            .zip(indexes)
+            .peekable();
+        let mut blocks = self.blocks.into_iter();
+        let mut content = Vec::with_capacity(total);
+        loop {
+            let at = u64::try_from(content.len()).unwrap_or(u64::MAX);
+            let block = if thinking.peek().is_some_and(|(_, index)| *index <= at) {
+                thinking.next().map(|(block, _)| block)
+            } else {
+                blocks
+                    .next()
+                    .or_else(|| thinking.next().map(|(block, _)| block))
+            };
+            let Some(block) = block else { break };
+            content.push(block);
+        }
+        json!({"role": "assistant", "content": content})
+    }
 }
 
 /// Whether a reasoning detail is Claude's own, which Claude can take back: an
@@ -1038,6 +1184,207 @@ mod tests {
         assert_eq!(content.as_array().unwrap().len(), 3, "{content}");
     }
 
+    fn signed(index: Option<u64>, signature: &str) -> serde_json::Value {
+        let mut detail = json!({"type":"reasoning.text","text":"","signature":signature,"format":"anthropic-claude-v1"});
+        if let Some(index) = index {
+            detail["index"] = json!(index);
+        }
+        detail
+    }
+
+    fn call(id: &str) -> serde_json::Value {
+        json!({"id":id,"type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}})
+    }
+
+    #[test]
+    fn the_words_before_a_call_go_back_after_the_thinking_claude_wrote_first() {
+        // Haarness sends the words Claude wrote before a call as their own
+        // message, and the call with the turn's thinking in the next one.
+        // Anthropic joins the two, and thinking that came after the words
+        // was refused as written for another conversation.
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5-5",
+            "messages": [
+                {"role":"user","content":"fix it"},
+                {"role":"assistant","content":"I'll read the file first."},
+                {"role":"assistant","content":null,"tool_calls":[call("toolu_1"), call("toolu_2")],
+                 "reasoning_details":[signed(Some(0), "sig")]},
+                {"role":"tool","tool_call_id":"toolu_1","content":"a"},
+                {"role":"tool","tool_call_id":"toolu_2","content":"b"}
+            ]
+        }))
+        .unwrap();
+        let body = anthropic_request("claude-opus-5-5", &request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4, "{body}");
+        let kinds: Vec<_> = messages[1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["thinking", "text", "tool_use", "tool_use"]);
+        assert_eq!(messages[1]["content"][0]["signature"], "sig");
+        assert_eq!(
+            messages[1]["content"][1]["text"],
+            "I'll read the file first."
+        );
+    }
+
+    #[test]
+    fn thinking_between_calls_goes_back_between_them() {
+        // Claude wrote: thinking, words, call, thinking, call.
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [
+                {"role":"user","content":"fix it"},
+                {"role":"assistant","content":"Reading both."},
+                {"role":"assistant","tool_calls":[call("toolu_1"), call("toolu_2")],
+                 "reasoning_details":[signed(Some(0), "first"), signed(Some(3), "second")]},
+                {"role":"tool","tool_call_id":"toolu_1","content":"a"},
+                {"role":"tool","tool_call_id":"toolu_2","content":"b"}
+            ]
+        }))
+        .unwrap();
+        let body = anthropic_request("claude-sonnet-5-5", &request).unwrap();
+        let content = &body["messages"][1]["content"];
+        let shape: Vec<_> = content
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| {
+                block["signature"]
+                    .as_str()
+                    .or(block["id"].as_str())
+                    .or(block["type"].as_str())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(shape, ["first", "text", "toolu_1", "second", "toolu_2"]);
+    }
+
+    #[test]
+    fn thinking_without_usable_places_leads_its_turn() {
+        for details in [
+            // No index, as older clients and other routers send.
+            vec![signed(None, "a"), signed(None, "b")],
+            // Indexes that cannot be one response's places.
+            vec![signed(Some(2), "a"), signed(Some(1), "b")],
+            vec![signed(Some(0), "a"), signed(Some(9), "b")],
+            vec![signed(Some(0), "a"), signed(None, "b")],
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "claude-opus-5-5",
+                "messages": [
+                    {"role":"user","content":"fix it"},
+                    {"role":"assistant","content":"Reading."},
+                    {"role":"assistant","tool_calls":[call("toolu_1")],"reasoning_details":details},
+                    {"role":"tool","tool_call_id":"toolu_1","content":"a"}
+                ]
+            }))
+            .unwrap();
+            let body = anthropic_request("claude-opus-5-5", &request).unwrap();
+            let kinds: Vec<_> = body["messages"][1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(kinds, ["thinking", "thinking", "text", "tool_use"]);
+        }
+    }
+
+    #[test]
+    fn a_turn_split_in_two_keeps_each_cache_marker_on_its_own_last_block() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5-5",
+            "messages": [
+                {"role":"user","content":"fix it"},
+                {"role":"assistant","content":"Reading.","cache_control":{"type":"ephemeral"}},
+                {"role":"assistant","tool_calls":[call("toolu_1")],"reasoning_details":[signed(Some(0), "s")]},
+                {"role":"tool","tool_call_id":"toolu_1","content":"a","cache_control":{"type":"ephemeral"}}
+            ]
+        }))
+        .unwrap();
+        let body = anthropic_request("claude-opus-5-5", &request).unwrap();
+        let turn = &body["messages"][1]["content"];
+        assert!(turn[0].get("cache_control").is_none(), "{turn}");
+        assert_eq!(turn[1]["cache_control"]["type"], "ephemeral");
+        assert!(turn[2].get("cache_control").is_none(), "{turn}");
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn claude_models_that_think_unasked_bind_their_thinking_unasked() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/claude-opus-5-5",
+            "messages": [{"role":"user","content":"hi"}],
+            "max_completion_tokens": 4096
+        }))
+        .unwrap();
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-6",
+        ] {
+            let body = anthropic_request(model, &request).unwrap();
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"adaptive","display":"summarized",
+                       "block_binding":{"prefix_mismatch_behavior":"drop_block"}}),
+                "{model}"
+            );
+            assert!(body.get("output_config").is_none(), "{model}");
+        }
+        // Models that bind nothing are sent as they were.
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ] {
+            let body = anthropic_request(model, &request).unwrap();
+            assert!(body.get("thinking").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn thinking_comes_out_of_a_conversation_whole_turns_and_all() {
+        use super::without_thinking;
+        let mut body = json!({"messages": [
+            {"role":"user","content":[{"type":"text","text":"fix it"}]},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"","signature":"a"},
+                {"type":"text","text":"Reading."},
+                {"type":"tool_use","id":"toolu_1","name":"read","input":{}}
+            ]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a"}]},
+            {"role":"assistant","content":[{"type":"redacted_thinking","data":"x"}]},
+            {"role":"user","content":[{"type":"text","text":"go on"}]}
+        ]});
+        assert!(without_thinking(&mut body));
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role":"user","content":[{"type":"text","text":"fix it"}]},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Reading."},
+                    {"type":"tool_use","id":"toolu_1","name":"read","input":{}}
+                ]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a"}]},
+                {"role":"user","content":[{"type":"text","text":"go on"}]}
+            ])
+        );
+        // Nothing to take: nothing to ask again with.
+        assert!(!without_thinking(&mut body));
+    }
+
     #[test]
     fn another_providers_tool_ids_reach_claude_in_the_characters_it_takes() {
         // Kimi through OpenRouter names its calls `functions.read:0`; Anthropic
@@ -1106,7 +1453,7 @@ mod tests {
         // Every listed model keeps its answer.
         for (model, bound, refuses) in [
             ("claude-fable-5-1", true, true),
-            ("claude-mythos-5-1", false, true),
+            ("claude-mythos-5-1", true, true),
             ("claude-opus-5-5", true, true),
             ("claude-sonnet-5-5", true, true),
             ("claude-haiku-5-5", true, false),
