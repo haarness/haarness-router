@@ -106,8 +106,15 @@ pub(crate) async fn stream(
                     yield ProviderEvent::Finish { index: 0, reason: reason.into() };
                     completed = true;
                 }
-                "response.failed" | "error" => Err(RouterError::upstream(http::StatusCode::BAD_GATEWAY, "OpenAI Responses stream returned an error")
-                    .with_upstream_detail(router_core::detail::from_error_value(event.get("response").filter(|response| response.get("error").is_some()).unwrap_or(&event))))?,
+                "response.failed" | "error" => {
+                    let failure = event.get("response").filter(|response| response.get("error").is_some()).unwrap_or(&event);
+                    // A prompt longer than the window or one the content check flagged is said plainly
+                    // and not tried again; any other failure keeps the stream's words.
+                    Err(crate::sse::stream_request_refusal(failure).unwrap_or_else(|| {
+                        RouterError::upstream(http::StatusCode::BAD_GATEWAY, "OpenAI Responses stream returned an error")
+                            .with_upstream_detail(router_core::detail::from_error_value(failure))
+                    }))?;
+                }
                 _ => {}
             }
         }

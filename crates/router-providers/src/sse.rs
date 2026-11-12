@@ -216,6 +216,24 @@ pub fn stream_error(event: &Value) -> RouterError {
             .with_upstream_failure(UpstreamFailure::Other)
             .with_upstream_detail(detail);
     }
+    // A request the provider refused for what it holds reads as it does when
+    // refused with an HTTP status. OpenRouter sends that status as a number
+    // once the stream has begun; a named code is taken as a bad request, not a
+    // busy server, so it isn't tried again.
+    let as_request = match numeric {
+        Some(status) if matches!(status.as_u16(), 400 | 403 | 413) => Some(status),
+        None if status != http::StatusCode::TOO_MANY_REQUESTS => {
+            Some(http::StatusCode::BAD_REQUEST)
+        }
+        _ => None,
+    };
+    if let Some((status, message)) = as_request.and_then(|status| {
+        request_refusal(status, &raw.to_ascii_lowercase()).map(|message| (status, message))
+    }) {
+        return RouterError::upstream(status, message)
+            .with_upstream_failure(UpstreamFailure::Other)
+            .with_upstream_detail(detail);
+    }
     let (status, message) = match (status.as_u16(), named) {
         (429, _) => plain_refusal(status, &raw, None)
             .unwrap_or_else(|| (status, "upstream stream reported a rate limit".to_owned())),
@@ -276,39 +294,8 @@ fn plain_refusal(
         };
         return Some((http::StatusCode::PAYLOAD_TOO_LARGE, message));
     }
-    // A text-only model sent an image or other media (Z.ai: "messages.content.type
-    // is invalid, allowed values: ['text']").
-    if status.as_u16() == 400
-        && lower.contains("content.type is invalid")
-        && lower.contains("['text']")
-    {
-        return Some((
-            status,
-            "This model reads only text. Send the request without the image or file, or choose a model that reads them.".to_owned(),
-        ));
-    }
-    // A prompt longer than the model's window ("This endpoint's maximum context
-    // length is 16384 tokens", OpenAI's context_length_exceeded, Claude's
-    // "prompt is too long"): a client compacts the conversation on these words,
-    // which "upstream returned HTTP 400" never gave it.
-    if matches!(status.as_u16(), 400 | 413)
-        && [
-            "context_length_exceeded",
-            "maximum context length",
-            "context length exceeded",
-            "context window exceeded",
-            "exceeds the context window",
-            "model_context_window_exceeded",
-            "prompt is too long",
-            "input is too long",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
-        return Some((
-            status,
-            "The conversation is longer than this model's maximum context length, so the provider refused it. Compact the conversation, or choose a model with a larger context window.".to_owned(),
-        ));
+    if let Some(message) = request_refusal(status, &lower) {
+        return Some((status, message));
     }
     match status.as_u16() {
         401 | 403 if lower.contains("api keys are not supported") => Some((
@@ -337,6 +324,160 @@ fn plain_refusal(
         )),
         _ => None,
     }
+}
+
+/// What a caller reads when the provider's content check flagged the request.
+pub const CONTENT_FLAGGED: &str = "The model's provider flagged this conversation in its content check and refused it. Rephrase your last message, start a new chat if something earlier in this one set it off, or choose another model.";
+
+/// A request the provider will never take as it stands, refused for what it
+/// holds rather than for the key or the load: media a text-only model can't
+/// read, a content check, a prompt longer than the model's window. Read from
+/// the lower-cased error body; the same words whether the refusal came as an
+/// HTTP status or inside a stream.
+fn request_refusal(status: http::StatusCode, lower: &str) -> Option<String> {
+    // A text-only model sent an image or other media (Z.ai: "messages.content.type
+    // is invalid, allowed values: ['text']").
+    if status.as_u16() == 400
+        && lower.contains("content.type is invalid")
+        && lower.contains("['text']")
+    {
+        return Some("This model reads only text. Send the request without the image or file, or choose a model that reads them.".to_owned());
+    }
+    // A content check (Alibaba's data_inspection_failed for Qwen, "Input data
+    // may contain inappropriate content"; OpenAI's invalid_prompt; Azure's
+    // content_filter; OpenRouter's moderation, a 403 "your input was
+    // flagged"): sending it again is refused again.
+    if matches!(status.as_u16(), 400 | 403)
+        && [
+            "data_inspection_failed",
+            "datainspectionfailed",
+            "may contain inappropriate content",
+            "content_policy_violation",
+            "invalid_prompt",
+            "responsibleaipolicyviolation",
+            "content_filter",
+            "was flagged",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return Some(CONTENT_FLAGGED.to_owned());
+    }
+    // A prompt longer than the model's window ("This endpoint's maximum context
+    // length is 16384 tokens", OpenAI's context_length_exceeded, Claude's
+    // "prompt is too long"): a client compacts the conversation on these words,
+    // which "upstream returned HTTP 400" never gave it. The window the provider
+    // names is said as "maximum context length is N tokens", which clients
+    // read to compact once to the right size.
+    if matches!(status.as_u16(), 400 | 413) && context_overflow(lower) {
+        return Some(match named_window(lower) {
+            Some(window) => format!(
+                "The conversation is longer than this model's maximum context length, so the provider refused it (its maximum context length is {window} tokens). Compact the conversation, or choose a model with a larger context window."
+            ),
+            None => "The conversation is longer than this model's maximum context length, so the provider refused it. Compact the conversation, or choose a model with a larger context window.".to_owned(),
+        });
+    }
+    None
+}
+
+/// A refusal inside a stream of a request the provider will never take as
+/// it stands (see [`request_refusal`]), read from the event's `error` only:
+/// `None` for any other failure, which keeps the stream's own words.
+#[must_use]
+pub fn stream_request_refusal(failure: &Value) -> Option<RouterError> {
+    // OpenAI's `error` event carries its code at the top; a failed response
+    // its `error`. The rest of a response (its instructions, its output) is
+    // never read.
+    let error = failure.get("error").or_else(|| {
+        (failure.get("type").and_then(Value::as_str) == Some("error")).then_some(failure)
+    })?;
+    let message = request_refusal(
+        http::StatusCode::BAD_REQUEST,
+        &error.to_string().to_ascii_lowercase(),
+    )?;
+    Some(
+        RouterError::upstream(http::StatusCode::BAD_REQUEST, message)
+            .with_upstream_failure(UpstreamFailure::Other)
+            .with_upstream_detail(router_core::detail::from_error_value(failure)),
+    )
+}
+
+/// A provider's words for a prompt longer than the model's window, as the
+/// servers behind the router say them: `OpenAI`, `OpenRouter`, vLLM and
+/// `DeepSeek` ("maximum context length is 32768 tokens"), Claude ("prompt is
+/// too long"), `DeepInfra` ("should not exceed `max_num_tokens` (32768)",
+/// "exceeds maximum input length 131071"), `OpenRouter` past every endpoint
+/// ("longer than the model's max input length (131072 tokens)"), llama.cpp,
+/// `xAI`, Moonshot, Qwen on `DashScope`, Gemini and Amazon Nova. An output limit above the model's
+/// ("`max_tokens` must be less than") and Z.ai's image count are no window:
+/// compacting can't answer them.
+fn context_overflow(lower: &str) -> bool {
+    if lower.contains("max_tokens must be less than")
+        || lower.contains("image count")
+        || lower.contains("图片数")
+    {
+        return false;
+    }
+    [
+        "context_length_exceeded",
+        "maximum context length",
+        "context length exceeded",
+        "context window exceeded",
+        "exceeds the context window",
+        "model_context_window_exceeded",
+        "prompt is too long",
+        "input is too long",
+        "prompt too long",
+        "should not exceed max_num_tokens",
+        "exceeds maximum input length",
+        "longer than the model's max input length",
+        "longer than the model's context length",
+        "exceeds the available context size",
+        "greater than the context length",
+        "longer than the maximum model length",
+        "context length is only",
+        "maximum prompt length is",
+        "exceeded model token limit",
+        "reduce the length of the messages",
+        "range of input length should be",
+        "exceeds the maximum number of tokens",
+        "number of input tokens exceeds maximum length",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// The context window a refusal of a prompt as too long names: the least
+/// number after one of the providers' phrasings ("maximum context length is
+/// 32768 tokens", "`max_num_tokens` (32768)", "200000 maximum" after Claude's
+/// "tokens > "). A count of the refused request is never taken.
+fn named_window(lower: &str) -> Option<u64> {
+    const BEFORE: [&str; 12] = [
+        "maximum context length is ",
+        "max_num_tokens (",
+        "max input length (",
+        "maximum input length ",
+        "available context size (",
+        "context length is only ",
+        "maximum prompt length is ",
+        "model token limit: ",
+        "input length should be [1, ",
+        "maximum number of tokens allowed (",
+        "maximum model length of ",
+        " tokens > ",
+    ];
+    BEFORE
+        .iter()
+        .filter_map(|before| {
+            let (_, rest) = lower.split_once(before)?;
+            let digits: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .filter(char::is_ascii_digit)
+                .collect();
+            digits.parse::<u64>().ok().filter(|window| *window >= 1_024)
+        })
+        .min()
 }
 
 /// The provider's own request ID, when one is present and safe to log.
@@ -459,12 +600,40 @@ mod tests {
         let openrouter = r#"{"error":{"message":"This endpoint's maximum context length is 32768 tokens. However, you requested about 41797 tokens (337 of text input, 15246 of tool input, 26214 in the output). Please reduce the length of either one, or use the context-compression plugin to compress your prompt automatically.","code":400}}"#;
         let openai = r#"{"error":{"message":"Your input exceeds the context window of this model.","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
         let claude = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#;
-        for body in [openrouter, openai, claude] {
+        let deepinfra = r#"{"error":{"message":"The sum of prompt length (66478.0), query length (0) should not exceed max_num_tokens (32768)","code":400}}"#;
+        for (body, window) in [
+            (openrouter, Some("32768")),
+            (openai, None),
+            (claude, Some("200000")),
+            (deepinfra, Some("32768")),
+        ] {
             let (status, message) =
                 plain_refusal(http::StatusCode::BAD_REQUEST, body, None).expect(body);
             assert_eq!(status, http::StatusCode::BAD_REQUEST);
             assert!(message.contains("maximum context length"), "{message}");
-            assert!(!message.contains("41797") && !message.contains("210000"));
+            // The window is said as clients read it; the refused request's
+            // own counts never are.
+            match window {
+                Some(window) => assert!(
+                    message.contains(&format!("maximum context length is {window} tokens")),
+                    "{message}"
+                ),
+                None => assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}"),
+            }
+            for count in ["41797", "210000", "66478"] {
+                assert!(!message.contains(count), "{message}");
+            }
+        }
+        // An output limit above the model's and Z.ai's image count are no
+        // window: compacting can't answer them.
+        for body in [
+            r#"{"message":"max_tokens must be less than or equal to 4096, too many tokens"}"#,
+            r#"{"error":{"code":"1261","message":"Prompt too long; exceeded max image count"}}"#,
+        ] {
+            assert!(
+                plain_refusal(http::StatusCode::BAD_REQUEST, body, None).is_none(),
+                "{body}"
+            );
         }
         // Another 400 keeps the generic status line.
         assert!(
@@ -474,6 +643,89 @@ mod tests {
                 None
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn a_request_refused_inside_a_stream_reads_as_one_refused_with_a_status() {
+        use super::{CONTENT_FLAGGED, stream_error, stream_request_refusal};
+        // DeepInfra serving deepseek/deepseek-chat behind OpenRouter, after the
+        // stream began: a client must compact, and learn the 32K window.
+        let long = serde_json::json!({"id":"gen-1","object":"chat.completion.chunk","model":"deepseek/deepseek-chat","provider":"DeepInfra","choices":[],"error":{"code":400,"message":"Upstream error from DeepInfra: The sum of prompt length (66478.0), query length (0) should not exceed max_num_tokens (32768)","metadata":{"error_type":"invalid_request"}}});
+        let error = stream_error(&long);
+        assert_eq!(error.status, http::StatusCode::BAD_REQUEST);
+        assert!(!error.retryable);
+        // OpenRouter itself, for a prompt past every endpoint's input limit.
+        let past_all = serde_json::json!({"error":{"code":413,"message":"The input (137016 tokens) is longer than the model's max input length (131072 tokens)."}});
+        let refused = stream_error(&past_all);
+        assert_eq!(refused.status, http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            refused
+                .body
+                .message
+                .contains("maximum context length is 131072 tokens"),
+            "{}",
+            refused.body.message
+        );
+        assert!(!refused.body.message.contains("137016"));
+        assert!(
+            error
+                .body
+                .message
+                .contains("maximum context length is 32768 tokens"),
+            "{}",
+            error.body.message
+        );
+        assert!(!error.body.message.contains("66478"));
+        // Alibaba's content check on Qwen, its SSE line passed on by OpenRouter.
+        let flagged = serde_json::json!({"error":{"code":400,"message":"Provider returned error","metadata":{"raw":"data: {\"error\":{\"code\":\"data_inspection_failed\",\"param\":null,\"message\":\"Input data may contain inappropriate content.\",\"type\":\"data_inspection_failed\"},\"id\":\"chatcmpl-1\"}","provider_name":"Alibaba"}}});
+        let error = stream_error(&flagged);
+        assert_eq!(error.status, http::StatusCode::BAD_REQUEST);
+        assert_eq!(error.body.message, CONTENT_FLAGGED);
+        assert!(error.upstream_detail().is_some());
+        // A named code is a bad request, not a busy server to try again.
+        let named = serde_json::json!({"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}});
+        let error = stream_error(&named);
+        assert_eq!(error.status, http::StatusCode::BAD_REQUEST);
+        assert!(!error.retryable);
+        assert!(error.body.message.contains("maximum context length"));
+        // OpenAI Responses: a failed response's error, never its instructions.
+        let failed = serde_json::json!({"id":"resp_1","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}});
+        let error = stream_request_refusal(&failed).expect("refused");
+        assert_eq!(error.status, http::StatusCode::BAD_REQUEST);
+        let busy = serde_json::json!({"id":"resp_2","status":"failed","instructions":"Say when the maximum context length is reached; never post content_filter words.","error":{"code":"server_error","message":"The server had an error"}});
+        assert!(stream_request_refusal(&busy).is_none());
+        let event = serde_json::json!({"type":"error","code":"invalid_prompt","message":"Invalid prompt: your prompt was flagged as potentially violating our usage policy."});
+        assert_eq!(
+            stream_request_refusal(&event)
+                .expect("flagged")
+                .body
+                .message,
+            CONTENT_FLAGGED
+        );
+        // OpenRouter's moderation refuses with 403; a key's 403 keeps its words.
+        let input_flagged = r#"{"error":{"code":403,"message":"Your chosen model requires moderation and your input was flagged"}}"#;
+        assert_eq!(
+            plain_refusal(http::StatusCode::FORBIDDEN, input_flagged, None)
+                .unwrap()
+                .1,
+            CONTENT_FLAGGED
+        );
+        assert_eq!(
+            plain_refusal(
+                http::StatusCode::FORBIDDEN,
+                r#"{"error":"forbidden"}"#,
+                None
+            )
+            .unwrap()
+            .1,
+            "The provider refused this request for this API key. Check what the key is allowed to use."
+        );
+        // A rate limit named inside a stream stays one.
+        let limited = serde_json::json!({"error":{"code":"rate_limit_exceeded","message":"Rate limit reached; too many tokens per minute"}});
+        assert_eq!(
+            stream_error(&limited).status,
+            http::StatusCode::TOO_MANY_REQUESTS
         );
     }
 
