@@ -11,12 +11,15 @@ mod bedrock;
 mod discovery_tests;
 
 /// Kinds of model Gemini lists that cannot answer a chat, matched as whole
-/// segments of the id. Image models also go by the brand `nano-banana`.
-const GEMINI_NON_CHAT: [&str; 12] = [
+/// segments of the id. Image models also go by the brand `nano-banana`, and
+/// video models by `omni`, which Gemini lists as thinking models that take
+/// `generateContent`.
+const GEMINI_NON_CHAT: [&str; 13] = [
     "image",
     "nano-banana",
     "imagen",
     "veo",
+    "omni",
     "lyria",
     "embedding",
     "tts",
@@ -973,6 +976,30 @@ mod tests {
             "gemini-5-flash-preview-tts",
         ] {
             assert!(entry(id, None).is_none(), "{id}");
+        }
+        // Media and speech models the Gemini API listed with `generateContent`
+        // on 2026-11-19; the video ones even say they think.
+        for id in [
+            "gemini-omni-1.1-flash",
+            "gemini-omni-1.2-flash",
+            "gemini-omni-flash-preview",
+            "gemini-3.5-transcribe",
+            "gemini-3.8-flash-tts",
+            "gemini-3.8-flash-lite-tts",
+            "lyria-3.5",
+        ] {
+            assert!(entry(id, Some(true)).is_none(), "{id}");
+        }
+        // Models without `generateContent` stay out whatever their name.
+        for (id, method) in [
+            ("gemini-decision-1", "createDecision"),
+            ("gemini-3.8-live", "bidiGenerateContent"),
+            ("gemini-3.8-live-preview", "bidiGenerateContent"),
+            ("gemini-3.5-transcribe-live", "bidiGenerateContent"),
+        ] {
+            let entry =
+                json!({"name":format!("models/{id}"),"supportedGenerationMethods":[method]});
+            assert!(model_entry(&config, &entry).is_none(), "{id}");
         }
         let without =
             json!({"name":"models/gemini-5-embed","supportedGenerationMethods":["embedContent"]});
