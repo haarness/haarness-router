@@ -126,6 +126,15 @@ pub(crate) async fn stream(
     })
 }
 
+/// Probed 2026-11-19: GPT-6.2 Sol and Astra answer 400 to `temperature` at
+/// every reasoning effort, so a client's default is left out for them rather
+/// than fail the request. A newer generation is taken to do the same.
+fn accepts_temperature(model: &str) -> bool {
+    let family = crate::models::openai_family(model);
+    crate::models::gpt_version(&family)
+        .is_none_or(|(major, minor)| (major, minor.unwrap_or(0)) < (6, 2))
+}
+
 fn responses_request(model: &str, request: &ChatCompletionRequest) -> Result<Value, RouterError> {
     // A protocol switch must never silently drop fields whose meaning cannot
     // be represented by Responses. Compatible providers keep their own wire.
@@ -281,7 +290,7 @@ fn responses_request(model: &str, request: &ChatCompletionRequest) -> Result<Val
     if let Some(effort) = &request.reasoning_effort {
         body["reasoning"] = json!({"effort":effort,"summary":"auto"});
     }
-    if let Some(value) = request.temperature {
+    if let Some(value) = request.temperature.filter(|_| accepts_temperature(model)) {
         body["temperature"] = json!(value);
     }
     if let Some(value) = request.top_p {
@@ -362,6 +371,48 @@ mod tests {
         assert!(required("gpt-6-astra", &request));
         assert!(required("gpt-5.6-luna", &request));
         assert!(required("gpt-7-future", &request));
+    }
+
+    #[test]
+    fn gpt_6_2_gets_its_system_prompt_first_in_input_and_no_temperature() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"openai/gpt-6.2-sol", "reasoning_effort":"xhigh", "temperature":0.2,
+            "messages":[
+                {"role":"system","content":"You are terse."},
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello","reasoning_details":[{"format":"openai-responses-v1","item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque","summary":[]}}]},
+                {"role":"user","content":"again"}
+            ]
+        }))
+        .unwrap();
+        for model in ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-7"] {
+            assert!(required(model, &request), "{model}");
+            let body = responses_request(model, &request).unwrap();
+            // GPT-6.2 caches a system message that leads `input`, and nothing
+            // from top-level `instructions`, which it reads after `input`.
+            assert_eq!(
+                body["input"][0],
+                json!({"role":"system","content":"You are terse."}),
+                "{model}"
+            );
+            assert!(body.get("instructions").is_none(), "{model}");
+            assert!(body.get("temperature").is_none(), "{model}");
+            assert_eq!(body["reasoning"]["effort"], "xhigh");
+        }
+        // Earlier generations keep the temperature they were sent.
+        for model in ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-luna"] {
+            let body = responses_request(model, &request).unwrap();
+            assert_eq!(body["temperature"], 0.2, "{model}");
+        }
+        // A developer message leads as well.
+        let developer: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"openai/gpt-6.2-astra",
+            "messages":[{"role":"developer","content":"Answer in French."},{"role":"user","content":"hi"}]
+        }))
+        .unwrap();
+        let body = responses_request("gpt-6.2-astra", &developer).unwrap();
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(body.get("instructions").is_none());
     }
 
     #[test]

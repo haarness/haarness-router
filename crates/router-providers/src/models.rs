@@ -596,7 +596,7 @@ fn openai_chat_model(id: &str) -> bool {
 
 /// The base model of an id, lowercase: a fine-tune is
 /// `ft:<family>:<org>:<suffix>` and only the family says what it is.
-fn openai_family(id: &str) -> String {
+pub(crate) fn openai_family(id: &str) -> String {
     let lower = id.to_ascii_lowercase();
     let family = lower.strip_prefix("ft:").unwrap_or(&lower);
     family.split(':').next().unwrap_or(family).to_owned()
@@ -605,7 +605,7 @@ fn openai_family(id: &str) -> String {
 /// A GPT id's version: `(5, None)` for `gpt-5-mini` and the snapshot
 /// `gpt-5-2025-08-07`, `(5, Some(1))` for `gpt-5.1` and `gpt-5-1`,
 /// `(7, None)` for `gpt-7`.
-fn gpt_version(family: &str) -> Option<(u32, Option<u32>)> {
+pub(crate) fn gpt_version(family: &str) -> Option<(u32, Option<u32>)> {
     let rest = family.strip_prefix("gpt-")?;
     let major_len = rest
         .find(|c: char| !c.is_ascii_digit())
@@ -797,6 +797,13 @@ mod tests {
             ("gpt-6-astra", vec!["low", "medium", "high", "xhigh", "max"]),
             // Probed 2026-10-10: GPT-6.1 Sol answers 400 to `none`.
             ("gpt-6.1-sol", vec!["low", "medium", "high", "xhigh", "max"]),
+            // Probed 2026-11-19: GPT-6.2 Sol and Astra answer 400 to `none`
+            // and `minimal` and take `low` to `max`.
+            ("gpt-6.2-sol", vec!["low", "medium", "high", "xhigh", "max"]),
+            (
+                "gpt-6.2-astra",
+                vec!["low", "medium", "high", "xhigh", "max"],
+            ),
             (
                 "gpt-6-sol",
                 vec!["none", "low", "medium", "high", "xhigh", "max"],

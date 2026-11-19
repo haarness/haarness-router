@@ -163,7 +163,9 @@ Completions refuses that pair). The public API stays Chat Completions: text, ima
 tools, structured output, usage, reasoning summaries and encrypted reasoning continuation are translated.
 Requests use `store: false`, and continuation state travels in opaque `reasoning_details` that clients must
 send back. A Chat-only field the Responses API cannot take returns a named 400; Responses-only features such
-as hosted tools are not exposed.
+as hosted tools are not exposed. System and developer messages stay in `input` where the client put them, never
+in top-level `instructions`, which GPT-6.2 reads after `input` and does not cache. GPT-6.2 and later refuse
+`temperature` at every reasoning effort, so it is left out for them.
 
 ### Anthropic
 
