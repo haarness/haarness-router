@@ -861,6 +861,15 @@ mod tests {
         let config: ProviderConfig = serde_json::from_value(json!({"kind":"anthropic"})).unwrap();
         let live = model_entry(&config, &json!({"id":"claude-future", "capabilities":{"thinking":{"supported":true},"effort":{"low":{"supported":true},"medium":{"supported":false},"max":{"supported":true}}}})).unwrap();
         assert_eq!(live.metadata["reasoning_efforts"], json!(["low", "max"]));
+        // Fable 5.2 as Anthropic's catalog describes it: always thinking, every level.
+        let fable = model_entry(&config, &json!({"id":"claude-fable-5-2", "max_input_tokens":1_000_000, "max_tokens":128_000,
+            "capabilities":{"thinking":{"supported":true},"image_input":{"supported":true},"effort":{"low":{"supported":true},"medium":{"supported":true},"high":{"supported":true},"xhigh":{"supported":true},"max":{"supported":true}}}})).unwrap();
+        assert_eq!(
+            fable.metadata["reasoning_efforts"],
+            json!(["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(fable.metadata["context_window"], 1_000_000);
+        assert_eq!(fable.metadata["max_output_tokens"], 128_000);
         let manual = model_entry(&config, &json!({"id":"claude-haiku-4-5-20251001", "capabilities":{"thinking":{"supported":true}}})).unwrap();
         assert_eq!(
             manual.metadata["reasoning_efforts"],

@@ -414,9 +414,7 @@ async fn tool_round_trip(
     if model.starts_with("openai/") {
         first_request["reasoning_effort"] = json!("low");
     }
-    if model.starts_with("anthropic/claude-fable-5-1")
-        || model.starts_with("anthropic/claude-mythos-5-1")
-    {
+    if refuses_forced_tool(model) {
         // These models reject forced tool selection; still require an actual
         // tool call and a successful continuation in the assertions below.
         first_request["tool_choice"] = json!("auto");
@@ -474,6 +472,30 @@ async fn tool_round_trip(
         bail!("{model} returned no text after the tool result");
     }
     Ok(())
+}
+
+/// Claude Fable and Mythos from 5.1, and every family but Haiku from 5.5,
+/// refuse a forced tool choice, as the router's Anthropic adapter knows.
+fn refuses_forced_tool(model: &str) -> bool {
+    let Some(name) = model.strip_prefix("anthropic/claude-") else {
+        return false;
+    };
+    let Some((family, version)) = name.split_once('-') else {
+        return false;
+    };
+    let mut numbers = version
+        .split(['-', '.'])
+        .take_while(|part| !part.is_empty() && part.len() <= 2)
+        .map_while(|part| part.parse::<u32>().ok());
+    let Some(major) = numbers.next() else {
+        return false;
+    };
+    let version = (major, numbers.next().unwrap_or(0));
+    match family {
+        "haiku" => false,
+        "fable" | "mythos" => version >= (5, 1),
+        _ => version >= (5, 5),
+    }
 }
 
 async fn image_input(
@@ -619,4 +641,33 @@ async fn reasoning(
         bail!("{model} returned no text after signed reasoning continuation");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_tool_round_trip_lets_models_that_refuse_a_forced_tool_choose() {
+        for model in [
+            "anthropic/claude-fable-5-1",
+            "anthropic/claude-mythos-5-1",
+            "anthropic/claude-fable-5-2",
+            "anthropic/claude-mythos-5-2",
+            "anthropic/claude-fable-5.2",
+            "anthropic/claude-opus-5-5",
+            "anthropic/claude-sonnet-5-5-20261001",
+        ] {
+            assert!(super::refuses_forced_tool(model), "{model}");
+        }
+        for model in [
+            "anthropic/claude-haiku-5-5",
+            "anthropic/claude-opus-5",
+            "anthropic/claude-sonnet-5",
+            "anthropic/claude-haiku-4-5-20251001",
+            "anthropic/claude-3-5-sonnet-20241022",
+            "openai/gpt-6.2-sol",
+            "gemini/gemini-4-neon",
+        ] {
+            assert!(!super::refuses_forced_tool(model), "{model}");
+        }
+    }
 }

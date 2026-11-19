@@ -1454,6 +1454,8 @@ mod tests {
         for (model, bound, refuses) in [
             ("claude-fable-5-1", true, true),
             ("claude-mythos-5-1", true, true),
+            ("claude-fable-5-2", true, true),
+            ("claude-mythos-5-2", true, true),
             ("claude-opus-5-5", true, true),
             ("claude-sonnet-5-5", true, true),
             ("claude-haiku-5-5", true, false),
@@ -1472,6 +1474,67 @@ mod tests {
         ] {
             assert_eq!(prefix_bound_thinking(model), bound, "{model}");
             assert_eq!(rejects_forced_tool_choice(model), refuses, "{model}");
+        }
+    }
+
+    #[test]
+    fn fable_and_mythos_5_2_get_every_rule_5_1_gets_in_every_spelling() {
+        use super::{
+            accepts_sampling, prefix_bound_thinking, rejects_forced_tool_choice,
+            uses_manual_thinking,
+        };
+        // As the Claude API, Bedrock and Vertex name them.
+        for model in [
+            "claude-fable-5-2",
+            "claude-mythos-5-2",
+            "claude-fable-5.2",
+            "claude-mythos-5.2",
+            "claude-fable-5-2-20261109",
+            "global.anthropic.claude-fable-5-2",
+            "global.anthropic.claude-mythos-5-2-v1:0",
+            "us.anthropic.claude-fable-5-2-v1:0",
+            "claude-fable-5-2@20261109",
+            "claude-mythos-5-2@20261109",
+        ] {
+            assert!(prefix_bound_thinking(model), "{model}");
+            assert!(rejects_forced_tool_choice(model), "{model}");
+            assert!(!accepts_sampling(model), "{model}");
+            assert!(!uses_manual_thinking(model), "{model}");
+            // Unasked, its thinking is bound and summarized; sampling is left out.
+            let plain: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model, "messages": [{"role":"user","content":"hi"}],
+                "temperature": 0.2, "top_p": 0.9
+            }))
+            .unwrap();
+            let body = anthropic_request(model, &plain).unwrap();
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"adaptive","display":"summarized",
+                       "block_binding":{"prefix_mismatch_behavior":"drop_block"}}),
+                "{model}"
+            );
+            assert!(body.get("temperature").is_none(), "{model}");
+            assert!(body.get("top_p").is_none(), "{model}");
+            // Every level it lists goes as native effort with adaptive thinking.
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                let request: ChatCompletionRequest = serde_json::from_value(json!({
+                    "model": model, "messages": [{"role":"user","content":"hi"}],
+                    "reasoning_effort": effort
+                }))
+                .unwrap();
+                let body = anthropic_request(model, &request).unwrap();
+                assert_eq!(body["thinking"]["type"], "adaptive", "{model} {effort}");
+                assert!(body["thinking"].get("budget_tokens").is_none());
+                assert_eq!(body["output_config"]["effort"], effort, "{model}");
+            }
+            // A forced tool choice is refused before Anthropic would.
+            let forced: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model, "messages": [{"role":"user","content":"weather"}],
+                "tool_choice": "required"
+            }))
+            .unwrap();
+            let error = anthropic_request(model, &forced).unwrap_err();
+            assert_eq!(error.body.param.as_deref(), Some("tool_choice"), "{model}");
         }
     }
 
