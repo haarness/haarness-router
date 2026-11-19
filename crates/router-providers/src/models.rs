@@ -196,11 +196,14 @@ fn vertex_catalog_url(config: &ProviderConfig, key: &SecretString) -> Option<url
 /// API key the router cannot read the catalog. These are the Gemini chat
 /// models Vertex serves; each is kept only when the key's project reaches it,
 /// which the free `countTokens` call answers. Models missing here can still be
-/// requested by ID.
-const VERTEX_KEY_MODELS: [&str; 12] = [
+/// requested by ID. Gemini 3.7 Flash left on 2026-11-19 (Google routes it to
+/// 3.8 Flash).
+const VERTEX_KEY_MODELS: [&str; 14] = [
+    "gemini-4-neon",
+    "gemini-4-hydrogen",
+    "gemini-4-carbon",
     "gemini-4-argon",
     "gemini-3.8-flash",
-    "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
