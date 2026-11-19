@@ -77,6 +77,13 @@ The key goes in `x-goog-api-key`. Google does not let an API key read the Model 
 checks a built-in list of current Gemini models with Vertex's free `countTokens` call and lists the ones the
 key's project can use. Any other model can still be requested by its ID.
 
+Google serves a key at this endpoint from one of its project's regional locations, and the newest Gemini models
+may exist only in the project's global location (on 2026-11-19 Gemini 4 Neon, Hydrogen and Carbon were missing
+from `asia-southeast1`). When Vertex answers 404 naming the project and a regional location, the request is
+sent once more to `…/v1/projects/<project>/locations/global/publishers/google`; when that answers, later
+requests for that model with that key go there directly. The `countTokens` check in discovery does the same.
+Models the endpoint already serves stay where they are.
+
 With an OAuth access token instead, name the project and location and set `auth_header = "authorization"`,
 which sends the token as a Bearer token:
 

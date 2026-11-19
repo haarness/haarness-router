@@ -1518,6 +1518,118 @@ async fn vertex_api_keys_go_in_the_google_key_header_even_where_bearer_is_config
 }
 
 #[tokio::test]
+async fn a_vertex_key_reaches_models_only_its_projects_global_location_serves() {
+    // As on 2026-11-19: Vertex serves a key at the project-less endpoint from a
+    // regional location of its project, which lacks Gemini 4 Neon and names
+    // the project in its 404; the project's global location has Neon.
+    async fn vertex(
+        State(seen): State<Arc<Mutex<Vec<String>>>>,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+    ) -> Response {
+        assert_eq!(headers["x-goog-api-key"], "native-provider-secret");
+        let path = uri.path().to_owned();
+        seen.lock().unwrap().push(path.clone());
+        let model = path
+            .rsplit('/')
+            .next()
+            .and_then(|last| last.split(':').next())
+            .unwrap_or_default()
+            .to_owned();
+        let global = path.starts_with("/v1/projects/1234567/locations/global/");
+        let (status, kind, body) = match (model.as_str(), global) {
+            ("gemini-4-argon", false) | ("gemini-4-neon", true) => (
+                StatusCode::OK,
+                "text/event-stream",
+                format!("data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{model}-ok\"}}]}},\"finishReason\":\"STOP\"}}]}}\n\n"),
+            ),
+            ("gemini-4-neon" | "gemini-4-carbon", false) => (
+                StatusCode::NOT_FOUND,
+                "application/json",
+                serde_json::json!({"error":{"code":404,"status":"NOT_FOUND","message":format!("Publisher model `projects/1234567/locations/asia-southeast1/publishers/google/models/{model}` was not found or your project does not have access to it.")}}).to_string(),
+            ),
+            _ => (
+                StatusCode::NOT_FOUND,
+                "application/json",
+                serde_json::json!({"error":{"code":404,"status":"NOT_FOUND","message":"Requested entity was not found."}}).to_string(),
+            ),
+        };
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, kind)
+            .body(Body::from(body))
+            .unwrap()
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = AxumRouter::new()
+        .route("/v1/publishers/google/models/{model}", post(vertex))
+        .route(
+            "/v1/projects/{project}/locations/{location}/publishers/google/models/{model}",
+            post(vertex),
+        )
+        .with_state(seen.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let config = config(BTreeMap::from([(
+        "google-vertex".into(),
+        native_provider(
+            ProviderKind::Gemini,
+            format!("http://{addr}/v1/publishers/google"),
+        ),
+    )]));
+    let adapters = router_providers::build_adapters(&config).unwrap();
+    let router = Router::with_provider_keys(config, adapters, HashMap::new()).unwrap();
+    let app = router_server::app(router_server::AppState::new(
+        router,
+        AuthStore::from_keys(["router-secret"], true),
+    ));
+    let chat = |model: &str| {
+        app.clone().oneshot(json_chat_request(serde_json::json!({
+            "model": format!("google-vertex/{model}"),
+            "messages": [{"role":"user","content":"hello"}],
+            "max_tokens": 10
+        })))
+    };
+    let regional =
+        |model: &str| format!("/v1/publishers/google/models/{model}:streamGenerateContent");
+    let global = |model: &str| {
+        format!(
+            "/v1/projects/1234567/locations/global/publishers/google/models/{model}:streamGenerateContent"
+        )
+    };
+    let asked = |expected: Vec<String>| {
+        assert_eq!(std::mem::take(&mut *seen.lock().unwrap()), expected);
+    };
+
+    // Neon is not found regionally, so it is asked for in the global location,
+    // and from then on there directly.
+    for expected in [
+        vec![regional("gemini-4-neon"), global("gemini-4-neon")],
+        vec![global("gemini-4-neon")],
+    ] {
+        let response = chat("gemini-4-neon").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("gemini-4-neon-ok"));
+        asked(expected);
+    }
+    // A model the endpoint serves stays where it is served.
+    let response = chat("gemini-4-argon").await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    asked(vec![regional("gemini-4-argon")]);
+    // Found in neither location: the caller gets the 404, and nothing is remembered.
+    let response = chat("gemini-4-carbon").await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    asked(vec![regional("gemini-4-carbon"), global("gemini-4-carbon")]);
+    // Another 404 is not asked again anywhere.
+    let response = chat("gemini-gone").await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    asked(vec![regional("gemini-gone")]);
+    server.abort();
+}
+
+#[tokio::test]
 async fn provider_refusals_reach_the_caller_in_plain_words_with_its_wait() {
     async fn refuse(Json(body): Json<serde_json::Value>) -> Response {
         let (status, retry, text) = match body["model"].as_str().unwrap_or_default() {

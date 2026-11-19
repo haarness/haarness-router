@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     attachment::prepare_pdf_fallback,
-    sse::{request_error, upstream_request_id},
+    sse::{request_error, upstream_failure, upstream_request_id},
     transport::ProviderTransport,
 };
 
@@ -31,6 +31,98 @@ pub(crate) fn sends_bearer(config: &ProviderConfig, key: &str) -> bool {
     config.auth_header.as_deref() == Some("authorization") && !google_api_key(key)
 }
 
+/// Whether `base_url` is Vertex's publisher endpoint without a project
+/// (`…/v1/publishers/google`), which an API key reaches on its own.
+pub(crate) fn project_less_vertex(base_url: &str) -> bool {
+    url::Url::parse(base_url).is_ok_and(|url| {
+        let path = url.path().trim_end_matches('/');
+        path.ends_with("/publishers/google") && !path.contains("/projects/")
+    })
+}
+
+/// The project-less publisher endpoint `base_url` in `project`'s global
+/// location: `…/v1/projects/<project>/locations/global/publishers/google`.
+pub(crate) fn vertex_global_base(base_url: &str, project: &str) -> Option<String> {
+    let mut url = url::Url::parse(base_url).ok()?;
+    let prefix = url
+        .path()
+        .trim_end_matches('/')
+        .strip_suffix("/publishers/google")?
+        .to_owned();
+    url.set_path(&format!(
+        "{prefix}/projects/{project}/locations/global/publishers/google"
+    ));
+    Some(url.to_string())
+}
+
+/// The project Vertex named when it did not find a model in one of the
+/// project's regional locations. Its 404 reads (checked 2026-11-19) "Publisher
+/// model `projects/<number>/locations/<region>/publishers/google/models/<model>`
+/// was not found or your project does not have access to it."
+pub(crate) fn regional_miss(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let message = value.pointer("/error/message")?.as_str()?;
+    let path = message.strip_prefix("Publisher model `projects/")?;
+    let (project, path) = path.split_once('/')?;
+    let (location, path) = path.strip_prefix("locations/")?.split_once('/')?;
+    let named = path.starts_with("publishers/google/models/") && message.contains("was not found");
+    let project_id = !project.is_empty()
+        && project
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    (named && project_id && location != "global").then(|| project.to_owned())
+}
+
+/// Keys whose global-location models are remembered at most. A router that
+/// takes callers' own keys starts over rather than grow without bound.
+const VERTEX_GLOBAL_KEYS: usize = 256;
+
+/// The models a key reaches on Vertex only in its project's global location.
+/// An API key at the project-less publisher endpoint is served from one of
+/// its project's regional locations, where the newest Gemini models may not
+/// exist (Gemini 4 Neon, Hydrogen and Carbon did not in asia-southeast1 on
+/// 2026-11-19), while the same key reaches them in the project's global
+/// location. Only Vertex's 404 names the project, so a model it was not found
+/// for is asked for once more there, and when that answers, later requests
+/// for it go there directly. Other models stay where the endpoint serves them.
+/// Keys are held by a hash, never as they are.
+#[derive(Default)]
+pub(crate) struct VertexGlobal(std::sync::Mutex<HashMap<u64, (String, HashSet<String>)>>);
+
+impl VertexGlobal {
+    fn slot(key: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The project whose global location serves `model` to `key`, once a
+    /// request found it there.
+    pub(crate) fn project(&self, key: &str, model: &str) -> Option<String> {
+        let known = self.0.lock().ok()?;
+        let (project, models) = known.get(&Self::slot(key))?;
+        models.contains(model).then(|| project.clone())
+    }
+
+    pub(crate) fn remember(&self, key: &str, project: &str, model: &str) {
+        let Ok(mut known) = self.0.lock() else {
+            return;
+        };
+        let slot = Self::slot(key);
+        if known.len() >= VERTEX_GLOBAL_KEYS && !known.contains_key(&slot) {
+            known.clear();
+        }
+        let entry = known
+            .entry(slot)
+            .or_insert_with(|| (project.to_owned(), HashSet::new()));
+        if entry.0 != project {
+            *entry = (project.to_owned(), HashSet::new());
+        }
+        entry.1.insert(model.to_owned());
+    }
+}
+
 pub struct GeminiAdapter {
     transport: ProviderTransport,
     base_url: String,
@@ -38,6 +130,8 @@ pub struct GeminiAdapter {
     bearer_auth: bool,
     /// Reasoning levels per model from the last successful catalog read.
     levels: std::sync::RwLock<HashMap<String, Vec<String>>>,
+    /// With a key at Vertex's project-less endpoint: see [`VertexGlobal`].
+    vertex_global: VertexGlobal,
 }
 
 impl GeminiAdapter {
@@ -47,6 +141,7 @@ impl GeminiAdapter {
             base_url: config.effective_base_url()?,
             bearer_auth: config.auth_header.as_deref() == Some("authorization"),
             levels: std::sync::RwLock::default(),
+            vertex_global: VertexGlobal::default(),
         })
     }
 }
@@ -58,7 +153,8 @@ impl ProviderAdapter for GeminiAdapter {
         config: &ProviderConfig,
         api_key: Option<&SecretString>,
     ) -> Option<Vec<router_protocol::ModelObject>> {
-        let models = crate::models::discover(config, api_key).await?;
+        let models =
+            crate::models::discover_remembering(config, api_key, &self.vertex_global).await?;
         let levels = models
             .iter()
             .filter_map(|model| {
@@ -108,17 +204,48 @@ impl ProviderAdapter for GeminiAdapter {
             .ok()
             .and_then(|known| known.get(model).cloned());
         let body = gemini_request_with_levels(&request, levels.as_deref())?;
-        let url = format!(
-            "{}/models/{model}:streamGenerateContent?alt=sse",
-            self.base_url.trim_end_matches('/')
-        );
-        let request = self.transport.client().post(url);
-        let request = if self.bearer_auth && !google_api_key(key.expose_secret()) {
-            request.bearer_auth(key.expose_secret())
-        } else {
-            request.header("x-goog-api-key", key.expose_secret())
+        let bearer = self.bearer_auth && !google_api_key(key.expose_secret());
+        let send = |base: &str| {
+            let url = format!(
+                "{}/models/{model}:streamGenerateContent?alt=sse",
+                base.trim_end_matches('/')
+            );
+            let request = self.transport.client().post(url);
+            let request = if bearer {
+                request.bearer_auth(key.expose_secret())
+            } else {
+                request.header("x-goog-api-key", key.expose_secret())
+            };
+            request.json(&body).send()
         };
-        let response = request.json(&body).send().await.map_err(request_error)?;
+        // A key at Vertex's project-less endpoint may find a model only in its
+        // project's global location (see [`VertexGlobal`]).
+        let key_only_vertex = !bearer && project_less_vertex(&self.base_url);
+        let global = key_only_vertex
+            .then(|| self.vertex_global.project(key.expose_secret(), model))
+            .flatten()
+            .and_then(|project| vertex_global_base(&self.base_url, &project));
+        let mut response = send(global.as_deref().unwrap_or(&self.base_url))
+            .await
+            .map_err(request_error)?;
+        if key_only_vertex && global.is_none() && response.status() == http::StatusCode::NOT_FOUND {
+            let bytes = self.transport.error_body(&mut response).await;
+            let Some((project, global)) = regional_miss(&bytes).and_then(|project| {
+                let global = vertex_global_base(&self.base_url, &project)?;
+                Some((project, global))
+            }) else {
+                return Err(upstream_failure(
+                    response.status(),
+                    response.headers(),
+                    &bytes,
+                ));
+            };
+            response = send(&global).await.map_err(request_error)?;
+            if response.status().is_success() {
+                self.vertex_global
+                    .remember(key.expose_secret(), &project, model);
+            }
+        }
         let response = self.transport.checked(response).await?;
         let upstream_request_id = upstream_request_id(response.headers());
         let mut source = self.transport.sse(response, cancel);
@@ -949,5 +1076,89 @@ mod tests {
         assert_eq!(parts[3]["text"], "42");
         assert_eq!(parts[3]["thoughtSignature"], "text-signature");
         assert!(parts[4].get("thoughtSignature").is_none());
+    }
+
+    /// Vertex's 404 for a model its regional location lacks, as it read on
+    /// 2026-11-19 (with another project number).
+    fn regional_404(project: &str, location: &str, model: &str) -> Vec<u8> {
+        json!({"error":{"code":404,"status":"NOT_FOUND","message":format!(
+            "Publisher model `projects/{project}/locations/{location}/publishers/google/models/{model}` was not found or your project does not have access to it. Please ensure you are using a valid model version."
+        )}})
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_regional_vertex_miss_names_the_project_whose_global_location_to_try() {
+        use super::{project_less_vertex, regional_miss, vertex_global_base};
+        assert_eq!(
+            regional_miss(&regional_404("1234567", "asia-southeast1", "gemini-4-neon")).as_deref(),
+            Some("1234567")
+        );
+        // Already global, another 404, or a project that is not an id: nothing to try.
+        assert!(regional_miss(&regional_404("1234567", "global", "gemini-4-neon")).is_none());
+        assert!(regional_miss(&regional_404("12/../34", "us-central1", "gemini-4-neon")).is_none());
+        assert!(regional_miss(&regional_404("", "us-central1", "gemini-4-neon")).is_none());
+        assert!(
+            regional_miss(br#"{"error":{"code":404,"message":"models/gemini-gone is not found for API version v1"}}"#)
+                .is_none()
+        );
+        assert!(regional_miss(b"not json").is_none());
+
+        assert!(project_less_vertex(
+            "https://aiplatform.googleapis.com/v1/publishers/google"
+        ));
+        assert!(project_less_vertex(
+            "https://aiplatform.googleapis.com/v1/publishers/google/"
+        ));
+        assert!(!project_less_vertex(
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google"
+        ));
+        assert!(!project_less_vertex(
+            "https://generativelanguage.googleapis.com/v1beta"
+        ));
+        assert_eq!(
+            vertex_global_base(
+                "https://aiplatform.googleapis.com/v1/publishers/google",
+                "1234567"
+            )
+            .as_deref(),
+            Some(
+                "https://aiplatform.googleapis.com/v1/projects/1234567/locations/global/publishers/google"
+            )
+        );
+        assert!(
+            vertex_global_base("https://generativelanguage.googleapis.com/v1beta", "1").is_none()
+        );
+    }
+
+    #[test]
+    fn global_vertex_models_are_remembered_per_key_and_model() {
+        let global = super::VertexGlobal::default();
+        global.remember("key-one", "1234567", "gemini-4-neon");
+        global.remember("key-one", "1234567", "gemini-4-hydrogen");
+        assert_eq!(
+            global.project("key-one", "gemini-4-neon").as_deref(),
+            Some("1234567")
+        );
+        assert_eq!(
+            global.project("key-one", "gemini-4-hydrogen").as_deref(),
+            Some("1234567")
+        );
+        // A model served where the endpoint is, and another key, stay as they were.
+        assert!(global.project("key-one", "gemini-4-argon").is_none());
+        assert!(global.project("key-two", "gemini-4-neon").is_none());
+        // A key now in another project starts over there.
+        global.remember("key-one", "7654321", "gemini-4-carbon");
+        assert!(global.project("key-one", "gemini-4-neon").is_none());
+        assert_eq!(
+            global.project("key-one", "gemini-4-carbon").as_deref(),
+            Some("7654321")
+        );
+        // Many keys never grow it without bound.
+        for index in 0..=super::VERTEX_GLOBAL_KEYS {
+            global.remember(&format!("caller-{index}"), "1", "gemini-4-neon");
+        }
+        assert!(global.0.lock().unwrap().len() <= super::VERTEX_GLOBAL_KEYS);
     }
 }

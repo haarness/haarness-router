@@ -89,14 +89,19 @@ pub async fn checked_response(
     mut response: reqwest::Response,
     max_error_body_bytes: usize,
 ) -> Result<reqwest::Response, RouterError> {
-    let status = response.status();
-    if status.is_success() {
+    if response.status().is_success() {
         return Ok(response);
     }
-    let upstream_request_id = upstream_request_id(response.headers());
-    // Inspect only a bounded machine-readable error type/code. Never expose the
-    // arbitrary upstream message or raw body: either can contain echoed prompts,
-    // credentials, or provider-specific internals.
+    let bytes = error_body(&mut response, max_error_body_bytes).await;
+    Err(upstream_failure(
+        response.status(),
+        response.headers(),
+        &bytes,
+    ))
+}
+
+/// A failed response's body, as much of it as fits in `max_error_body_bytes`.
+pub async fn error_body(response: &mut reqwest::Response, max_error_body_bytes: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.ok().flatten() {
         if bytes.len().saturating_add(chunk.len()) > max_error_body_bytes {
@@ -104,15 +109,29 @@ pub async fn checked_response(
         }
         bytes.extend_from_slice(&chunk);
     }
-    let retry_after = response_retry_after(response.headers());
-    let detail = router_core::detail::from_error_body(&bytes);
-    if out_of_credit(status, &String::from_utf8_lossy(&bytes)) {
-        return Err(out_of_credit_error()
+    bytes
+}
+
+/// The error a failed provider response becomes, from its status, headers and
+/// the bounded body [`error_body`] read.
+pub fn upstream_failure(
+    status: http::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    bytes: &[u8],
+) -> RouterError {
+    let upstream_request_id = upstream_request_id(headers);
+    // Inspect only a bounded machine-readable error type/code. Never expose the
+    // arbitrary upstream message or raw body: either can contain echoed prompts,
+    // credentials, or provider-specific internals.
+    let retry_after = response_retry_after(headers);
+    let detail = router_core::detail::from_error_body(bytes);
+    if out_of_credit(status, &String::from_utf8_lossy(bytes)) {
+        return out_of_credit_error()
             .with_upstream_failure(UpstreamFailure::from_status(status))
             .with_upstream_detail(detail)
-            .with_upstream_request_id(upstream_request_id));
+            .with_upstream_request_id(upstream_request_id);
     }
-    let upstream_code = serde_json::from_slice::<Value>(&bytes)
+    let upstream_code = serde_json::from_slice::<Value>(bytes)
         .ok()
         .and_then(|value| {
             value
@@ -124,7 +143,7 @@ pub async fn checked_response(
                 .map(sanitize_code)
         })
         .filter(|value| !value.is_empty());
-    let (status, message) = plain_refusal(status, &String::from_utf8_lossy(&bytes), retry_after)
+    let (status, message) = plain_refusal(status, &String::from_utf8_lossy(bytes), retry_after)
         .unwrap_or_else(|| {
             let detail = upstream_code.map_or_else(String::new, |code| format!(" ({code})"));
             (
@@ -142,7 +161,7 @@ pub async fn checked_response(
         .and_then(|wait| {
             std::num::NonZeroU16::new(u16::try_from(wait.as_secs().max(1)).unwrap_or(u16::MAX))
         });
-    Err(error)
+    error
 }
 
 /// What a key's owner reads when the provider account behind the key has no

@@ -36,6 +36,16 @@ pub(crate) async fn discover(
     config: &ProviderConfig,
     key: Option<&SecretString>,
 ) -> Option<Vec<ModelObject>> {
+    discover_remembering(config, key, &crate::gemini::VertexGlobal::default()).await
+}
+
+/// [`discover`], keeping in `global` the models a key at Vertex's project-less
+/// endpoint was found to reach only in its project's global location.
+pub(crate) async fn discover_remembering(
+    config: &ProviderConfig,
+    key: Option<&SecretString>,
+    global: &crate::gemini::VertexGlobal,
+) -> Option<Vec<ModelObject>> {
     let key = key?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -47,7 +57,7 @@ pub(crate) async fn discover(
         return bedrock::discover(&client, config, key).await;
     }
     if vertex_publisher(config) && crate::gemini::google_api_key(key.expose_secret()) {
-        return vertex_key_models(&client, config, key).await;
+        return vertex_key_models(&client, config, key, global).await;
     }
     let vertex = vertex_catalog_url(config, key);
     // xAI's `/models` mixes its image and video generators in with its chat
@@ -219,18 +229,42 @@ async fn vertex_key_models(
     client: &reqwest::Client,
     config: &ProviderConfig,
     key: &SecretString,
+    global: &crate::gemini::VertexGlobal,
 ) -> Option<Vec<ModelObject>> {
     let base = config.effective_base_url().ok()?;
-    let base = base.trim_end_matches('/');
     let probe = json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]});
-    let found = futures::future::join_all(VERTEX_KEY_MODELS.iter().map(|id| {
-        let request = client
-            .post(format!("{base}/models/{id}:countTokens"))
+    let count = |base: &str, id: &str| {
+        client
+            .post(format!(
+                "{}/models/{id}:countTokens",
+                base.trim_end_matches('/')
+            ))
             .header("x-goog-api-key", key.expose_secret())
-            .json(&probe);
+            .json(&probe)
+            .send()
+    };
+    let found = futures::future::join_all(VERTEX_KEY_MODELS.iter().map(|id| {
+        let (base, count) = (&base, &count);
         async move {
-            let response = request.send().await.ok()?;
-            response.status().is_success().then_some(*id)
+            let mut response = count(base, id).await.ok()?;
+            if response.status().is_success() {
+                return Some(*id);
+            }
+            // A model the project's regional location lacks may be served
+            // in its global location (see `VertexGlobal`).
+            if response.status() != reqwest::StatusCode::NOT_FOUND
+                || !crate::gemini::project_less_vertex(base)
+            {
+                return None;
+            }
+            let body = crate::sse::error_body(&mut response, 16 * 1024).await;
+            let project = crate::gemini::regional_miss(&body)?;
+            let there = crate::gemini::vertex_global_base(base, &project)?;
+            let response = count(&there, id).await.ok()?;
+            response.status().is_success().then(|| {
+                global.remember(key.expose_secret(), &project, id);
+                *id
+            })
         }
     }))
     .await;

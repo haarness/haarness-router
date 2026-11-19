@@ -3,7 +3,7 @@ use std::time::Duration;
 use router_core::{ProviderConfig, RouterError};
 use tokio_util::sync::CancellationToken;
 
-use crate::sse::{JsonSseStream, checked_response, json_sse_stream};
+use crate::sse::{JsonSseStream, checked_response, error_body, json_sse_stream};
 
 /// Shared, bounded HTTP transport for one configured provider instance.
 ///
@@ -41,6 +41,13 @@ impl ProviderTransport {
         response: reqwest::Response,
     ) -> Result<reqwest::Response, RouterError> {
         checked_response(response, self.max_error_body_bytes).await
+    }
+
+    /// A failed response's body within the error-body bound, for an adapter
+    /// that reads the provider's refusal before deciding what to do; the
+    /// error it becomes is [`crate::sse::upstream_failure`].
+    pub(crate) async fn error_body(&self, response: &mut reqwest::Response) -> Vec<u8> {
+        error_body(response, self.max_error_body_bytes).await
     }
 
     pub(crate) fn sse(

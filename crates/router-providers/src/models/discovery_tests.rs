@@ -122,6 +122,66 @@ async fn vertex_with_an_api_key_lists_the_models_its_project_reaches() {
 }
 
 #[tokio::test]
+async fn vertex_with_an_api_key_finds_the_newest_models_in_its_projects_global_location() {
+    // As on 2026-11-19: the project-less endpoint serves the key from a
+    // regional location without Gemini 4 Neon, Hydrogen or Carbon, and the
+    // project's global location has Neon and Hydrogen.
+    let (url, requests, task) = fixture(|path| {
+        let model = path
+            .rsplit('/')
+            .next()
+            .and_then(|last| last.strip_suffix(":countTokens"))
+            .unwrap_or_default();
+        let regional = path.starts_with("/v1/publishers/google/models/");
+        let global = path.starts_with("/v1/projects/1234567/locations/global/publishers/google/models/");
+        match model {
+            "gemini-4-argon" | "gemini-3.8-flash" if regional => (200, json!({"totalTokens":1})),
+            "gemini-4-neon" | "gemini-4-hydrogen" if global => (200, json!({"totalTokens":1})),
+            "gemini-4-neon" | "gemini-4-hydrogen" | "gemini-4-carbon" if regional => (
+                404,
+                json!({"error":{"code":404,"status":"NOT_FOUND","message":format!("Publisher model `projects/1234567/locations/asia-southeast1/publishers/google/models/{model}` was not found or your project does not have access to it.")}}),
+            ),
+            _ => (404, json!({"error":{"code":404}})),
+        }
+    })
+    .await;
+    let config: ProviderConfig = serde_json::from_value(json!({"kind":"gemini","base_url":format!("{url}/v1/publishers/google"),"allow_insecure_http":true})).unwrap();
+    let global = crate::gemini::VertexGlobal::default();
+    let models = discover_remembering(&config, Some(&SecretString::from("AQ.bound-key")), &global)
+        .await
+        .unwrap();
+    task.abort();
+    assert_eq!(
+        models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        [
+            "gemini-4-neon",
+            "gemini-4-hydrogen",
+            "gemini-4-argon",
+            "gemini-3.8-flash"
+        ]
+    );
+    assert_eq!(
+        models[0].metadata["reasoning_efforts"],
+        json!(["low", "medium", "high", "xhigh"])
+    );
+    // Each of the three misses was asked once more in the global location.
+    assert_eq!(requests.lock().unwrap().len(), VERTEX_KEY_MODELS.len() + 3);
+    // Neon and Hydrogen are remembered there for the key; the rest stay put.
+    for (model, project) in [
+        ("gemini-4-neon", Some("1234567")),
+        ("gemini-4-hydrogen", Some("1234567")),
+        ("gemini-4-carbon", None),
+        ("gemini-4-argon", None),
+    ] {
+        assert_eq!(
+            global.project("AQ.bound-key", model).as_deref(),
+            project,
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn vertex_with_a_refused_api_key_lists_nothing() {
     let (url, _, task) = fixture(|_| (401, json!({"error":{"code":401}}))).await;
     let config: ProviderConfig = serde_json::from_value(json!({"kind":"gemini","base_url":format!("{url}/v1/publishers/google"),"allow_insecure_http":true})).unwrap();
