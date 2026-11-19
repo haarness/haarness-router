@@ -126,13 +126,14 @@ pub(crate) async fn stream(
     })
 }
 
-/// Probed 2026-11-19: GPT-6.2 Sol and Astra answer 400 to `temperature` at
-/// every reasoning effort, so a client's default is left out for them rather
-/// than fail the request. A newer generation is taken to do the same.
-fn accepts_temperature(model: &str) -> bool {
+/// Whether `temperature` and `top_p` may go with this request. GPT-6 and
+/// later take them only with reasoning off (`none`), which GPT-6.1 Sol and
+/// GPT-6.2 do not offer: GPT-6.2 Sol and Astra answer 400 to either at every
+/// other effort (probed 2026-11-19). A client's defaults are left out rather
+/// than fail the request; a newer generation is taken to do the same.
+fn accepts_sampling(model: &str, effort: Option<&str>) -> bool {
     let family = crate::models::openai_family(model);
-    crate::models::gpt_version(&family)
-        .is_none_or(|(major, minor)| (major, minor.unwrap_or(0)) < (6, 2))
+    crate::models::gpt_version(&family).is_none_or(|(major, _)| major < 6) || effort == Some("none")
 }
 
 fn responses_request(model: &str, request: &ChatCompletionRequest) -> Result<Value, RouterError> {
@@ -290,10 +291,11 @@ fn responses_request(model: &str, request: &ChatCompletionRequest) -> Result<Val
     if let Some(effort) = &request.reasoning_effort {
         body["reasoning"] = json!({"effort":effort,"summary":"auto"});
     }
-    if let Some(value) = request.temperature.filter(|_| accepts_temperature(model)) {
+    let sampling = accepts_sampling(model, request.reasoning_effort.as_deref());
+    if let Some(value) = request.temperature.filter(|_| sampling) {
         body["temperature"] = json!(value);
     }
-    if let Some(value) = request.top_p {
+    if let Some(value) = request.top_p.filter(|_| sampling) {
         body["top_p"] = json!(value);
     }
     if let Some(value) = request.parallel_tool_calls {
@@ -374,9 +376,9 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_2_gets_its_system_prompt_first_in_input_and_no_temperature() {
+    fn gpt_6_2_gets_its_system_prompt_first_in_input_and_no_sampling() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model":"openai/gpt-6.2-sol", "reasoning_effort":"xhigh", "temperature":0.2,
+            "model":"openai/gpt-6.2-sol", "reasoning_effort":"xhigh", "temperature":0.2, "top_p":0.9,
             "messages":[
                 {"role":"system","content":"You are terse."},
                 {"role":"user","content":"hi"},
@@ -397,13 +399,19 @@ mod tests {
             );
             assert!(body.get("instructions").is_none(), "{model}");
             assert!(body.get("temperature").is_none(), "{model}");
+            assert!(body.get("top_p").is_none(), "{model}");
             assert_eq!(body["reasoning"]["effort"], "xhigh");
         }
-        // Earlier generations keep the temperature they were sent.
-        for model in ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-luna"] {
-            let body = responses_request(model, &request).unwrap();
-            assert_eq!(body["temperature"], 0.2, "{model}");
-        }
+        // GPT-6 takes sampling only with reasoning off; GPT-5 keeps it.
+        let body = responses_request("gpt-6.1-sol", &request).unwrap();
+        assert!(body.get("temperature").is_none() && body.get("top_p").is_none());
+        let body = responses_request("gpt-5.6-luna", &request).unwrap();
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["top_p"], 0.9);
+        let mut off = request.clone();
+        off.reasoning_effort = Some("none".into());
+        let body = responses_request("gpt-6-sol", &off).unwrap();
+        assert_eq!(body["temperature"], 0.2);
         // A developer message leads as well.
         let developer: ChatCompletionRequest = serde_json::from_value(json!({
             "model":"openai/gpt-6.2-astra",
