@@ -782,6 +782,9 @@ mod tests {
     #[test]
     fn every_advertised_gemini_effort_uses_its_generation_contract() {
         for model in [
+            "gemini-4-neon",
+            "gemini-4-hydrogen",
+            "gemini-4-carbon",
             "gemini-4-argon",
             "gemini-3.8-flash",
             "gemini-3.5-flash-lite",
@@ -817,6 +820,18 @@ mod tests {
             ("gemini-4-argon", "minimal", "low"),
             ("gemini-4-argon", "none", "low"),
             ("gemini-4-argon", "max", "high"),
+            ("gemini-4-argon", "xhigh", "high"),
+            // Neon and Hydrogen think at `xhigh`, and `max` goes as `xhigh`;
+            // Carbon, like Argon, stops at `high`.
+            ("gemini-4-neon", "xhigh", "xhigh"),
+            ("gemini-4-neon", "max", "xhigh"),
+            ("gemini-4-neon", "none", "low"),
+            ("gemini-4-neon", "minimal", "low"),
+            ("gemini-4-hydrogen", "max", "xhigh"),
+            ("gemini-4-hydrogen", "minimal", "low"),
+            ("gemini-4-carbon", "xhigh", "high"),
+            ("gemini-4-carbon", "max", "high"),
+            ("gemini-4-carbon", "none", "low"),
             ("gemini-3.8-flash", "minimal", "low"),
             ("gemini-3-pro-preview", "medium", "high"),
             // A generation the table has never seen gets the newest levels.

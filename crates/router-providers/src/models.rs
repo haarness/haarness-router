@@ -677,8 +677,22 @@ fn gemini_generation(id: &str) -> Option<u32> {
 /// table below does not name.
 pub(crate) const GEMINI_NEWEST_EFFORTS: [&str; 3] = ["low", "medium", "high"];
 
+/// Gemini 4 families that also think at `xhigh`. Probed 2026-11-19: Neon and
+/// Hydrogen take it on the Gemini API and on Vertex, while Argon and Carbon
+/// answer it with a 400, so the level follows the family, not the version.
+const GEMINI_XHIGH_FAMILIES: [&str; 2] = ["gemini-4-neon", "gemini-4-hydrogen"];
+
 /// Model-family fallback only; provider-advertised capabilities take precedence.
 pub(crate) fn gemini_reasoning_efforts(id: &str) -> Vec<&'static str> {
+    // Probed 2026-11-19: no Gemini 4 model takes `minimal`. The API also
+    // takes an undocumented `max` without complaint; it is not offered, and
+    // a request for it goes as the strongest level the model lists.
+    if GEMINI_XHIGH_FAMILIES
+        .iter()
+        .any(|family| id.starts_with(family))
+    {
+        return vec!["low", "medium", "high", "xhigh"];
+    }
     // Probed 2026-10-15: Gemini 4 Argon answers `minimal` with a 400, as
     // 3.7/3.8 Flash and 3.1 Pro do; later generations are assumed to follow.
     if id.starts_with("gemini-3.8-flash")
@@ -1006,6 +1020,26 @@ mod tests {
             argon.metadata["reasoning_efforts"],
             json!(["low", "medium", "high"])
         );
+        // Entries as the Gemini API listed the Gemini 4 models on 2026-11-19.
+        for (id, output, efforts) in [
+            (
+                "gemini-4-neon",
+                65_536,
+                json!(["low", "medium", "high", "xhigh"]),
+            ),
+            (
+                "gemini-4-hydrogen",
+                65_536,
+                json!(["low", "medium", "high", "xhigh"]),
+            ),
+            ("gemini-4-carbon", 32_768, json!(["low", "medium", "high"])),
+        ] {
+            let model = model_entry(&config, &json!({"name":format!("models/{id}"),"inputTokenLimit":1_048_576,"outputTokenLimit":output,"thinking":true,"supportedGenerationMethods":["generateContent","countTokens","createCachedContent","batchGenerateContent"]})).unwrap();
+            assert_eq!(model.metadata["reasoning_efforts"], efforts, "{id}");
+            assert_eq!(model.metadata["context_window"], 1_048_576, "{id}");
+            assert_eq!(model.metadata["max_output_tokens"], output, "{id}");
+            assert_eq!(model.metadata["supports_tools"], true, "{id}");
+        }
         for id in [
             "veo-future",
             "gemini-nano-banana-2.1",

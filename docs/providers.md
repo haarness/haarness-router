@@ -196,14 +196,16 @@ with an empty text part beside it reaches Claude as the photo alone. A data URL 
 
 ### Gemini
 
-Gemini 3 and later use `thinkingLevel`, with the levels each generation accepts: Gemini 4 Argon, 3.8 and 3.7
-Flash and 3.1 Pro offer `low`, `medium` and `high`; Gemini 3 Pro `low` and `high`; other Gemini 3 models also
-`minimal`. Gemini 2.5 uses `thinkingBudget` (`low` 2,048, `medium` 8,192, `high` 24,576; `none` maps to zero
-only where thinking can be turned off). Thinking counts against the output limit, so with `max_tokens` or
+Gemini 3 and later use `thinkingLevel`, with the levels each model accepts: Gemini 4 Neon and Hydrogen offer
+`low`, `medium`, `high` and `xhigh`; Gemini 4 Argon and Carbon, 3.8 and 3.7 Flash and 3.1 Pro offer `low`,
+`medium` and `high`; Gemini 3 Pro `low` and `high`; other Gemini 3 models also `minimal`. Gemini 2.5 uses
+`thinkingBudget` (`low` 2,048, `medium` 8,192, `high` 24,576; `none` maps to zero only where thinking can be
+turned off). Thinking counts against the output limit, so with `max_tokens` or
 `max_completion_tokens` set an effort's budget is at most half of it and a short answer keeps room; it stays on
 unless half the limit is less than the model thinks at all, when 2.5 Pro thinks its minimum of 128 tokens and
 Flash and Flash-Lite (512 at least) stop thinking. A `reasoning.max_tokens` budget is sent as given. A
-level the model does not offer becomes its nearest offered level (the stronger of two equally near); the
+level the model does not offer becomes its nearest offered level (the stronger of two equally near), so `max`
+goes to Neon as `xhigh` and to Argon as `high`, and `none` to any Gemini 4 model as `low`; the
 levels come from the catalog when it was read, else from the table above, and a thinking model of a newer
 generation gets the newest levels. A model neither knows gets the level as asked. See
 Google's [thinking guide](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
